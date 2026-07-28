@@ -1,0 +1,93 @@
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.*
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# --- Editors / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.next/
+.nuxt/
+.turbo/
+*.tsbuildinfo
+
+# --- AI / ML artifacts ---
+# 가중치와 체크포인트는 저장소 밖에 두거나 다운로드 스크립트로 재현합니다.
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.gguf
+*.bin
+*.h5
+*.pkl
+*.joblib
+checkpoints/
+wandb/
+mlruns/
+outputs/
+runs/
+
+# --- Datasets / large data ---
+data/
+datasets/
+*.csv
+*.tsv
+*.parquet
+*.arrow
+*.npy
+*.npz
+*.sqlite
+*.db
+
+# --- Logs / temp ---
+*.log
+logs/
+tmp/
+.cache/
