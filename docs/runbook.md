@@ -24,6 +24,31 @@ uv run pytest -m "not integration" --cov=atrader
 `config/` 아래 5개 파일(`risk.yaml`이 필수, 나머지는 선택)이 있어야 한다. `risk.yaml`이
 없거나 파싱에 실패하면 **부팅을 거부한다**(spec §7.1) — 이것은 버그가 아니라 설계다.
 
+### 테스트 5계층과 인수기준 대응표
+
+| 계층 | 위치 | 인수기준 |
+|---|---|---|
+| 단위 | `tests/unit/` (전체 80%, `tests/unit/test_risk_coverage.py`가 리스크엔진+상태머신 95%를 별도 프로세스로 측정해 강제) | #1(임포트 경계), #2(커버리지) |
+| 속성(Hypothesis) | `tests/property/` — 리스크 한도 우회 불가(`test_risk_invariants.py`), 상태머신 64개 전이 쌍 전수 검증(`test_statemachine_invariants.py`), 포지션=체결합(`test_accounting_invariants.py`) | #2 |
+| 통합 | `tests/integration/test_paper_broker.py` — 부분체결·거부·지연·순서 뒤바뀜 | — |
+| 카오스 | `tests/chaos/` — `test_kill_after_send.py`(주문 전송 직후 kill), `test_reordered_events.py` | #4 |
+| 리플레이 | `tests/replay/test_replay.py` — 녹화 재생 바이트 비교, 결정론이 실제로 깨지는 음성 케이스 포함 | #3 |
+| 프롬프트 인젝션 | `tests/unit/test_prompt_injection.py` | #10 |
+| 킬스위치 타이밍 | `tests/unit/test_killswitch_timing.py` — 실제 벽시계 시간으로 측정(시뮬레이션 시계는 이 기준에서 아무 의미가 없다) | #5 |
+
+```bash
+uv run pytest tests/unit/test_risk_coverage.py         # 인수기준 #2: 95% 강제
+uv run pytest tests/replay -q                          # 인수기준 #3
+uv run pytest tests/chaos -q                           # 인수기준 #4
+uv run pytest tests/unit/test_killswitch_timing.py      # 인수기준 #5
+uv run pytest tests/unit/test_prompt_injection.py       # 인수기준 #10
+```
+
+인수기준 #7(30일 페이퍼 트레이딩 괴리 <30%)과 #8(RTO 5분)은 시간·인프라가 필요해
+자동화된 테스트로 검증할 수 없다 — 계획 단계에서부터 이번 세션 범위 밖으로 확정했다.
+`atrader reconcile`(§4)과 `Reconciler`가 #8이 요구하는 절차(재기동 시 상태 대조)의
+실제 구현체이므로, 실행 자체는 운영 단계에서 시간을 들여 수행해야 한다.
+
 ## 2. 페이퍼 트레이딩 실행
 
 ```bash
