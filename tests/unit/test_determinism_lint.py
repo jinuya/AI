@@ -29,6 +29,7 @@ ALLOWLIST: frozenset[str] = frozenset(
     {
         "core/clock.py",
         "core/ids.py",
+        "core/rng.py",
     }
 )
 
