@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -30,6 +32,12 @@ __all__ = [
     "ChainVerification",
     "canonical_json",
     "compute_hash",
+    "dump_records_jsonl",
+    "load_records_jsonl",
+    "record_from_jsonable",
+    "record_to_jsonable",
+    "records_from_json_bytes",
+    "records_to_json_bytes",
     "verify_chain",
 ]
 
@@ -182,3 +190,86 @@ def verify_chain(records: list[AuditRecord]) -> ChainVerification:
         expected_seq = record.seq + 1
 
     return ChainVerification(valid=True, records_checked=len(records))
+
+
+# ---------------------------------------------------------------------------
+# Offline export/import — spec §9.3 seven-year retention, verified out of band
+# from a live process (``atrader verify-audit``).
+# ---------------------------------------------------------------------------
+
+
+def record_to_jsonable(record: AuditRecord) -> dict[str, Any]:
+    return {
+        "seq": record.seq,
+        "event_type": record.event_type,
+        "actor": record.actor,
+        "payload": record.payload,
+        "created_at_ns": record.created_at_ns,
+        "prev_hash": record.prev_hash.hex(),
+        "hash": record.hash.hex(),
+    }
+
+
+def record_from_jsonable(data: dict[str, Any]) -> AuditRecord:
+    return AuditRecord(
+        seq=data["seq"],
+        event_type=data["event_type"],
+        actor=data["actor"],
+        payload=data["payload"],
+        created_at_ns=data["created_at_ns"],
+        prev_hash=bytes.fromhex(data["prev_hash"]),
+        hash=bytes.fromhex(data["hash"]),
+    )
+
+
+def dump_records_jsonl(records: Iterable[AuditRecord], path: Path) -> int:
+    """Write records as one JSON object per line, in order.
+
+    The same ``default=`` normalisation :func:`canonical_json` uses (Decimal
+    to its exact string, UUID to its string form, etc.) is applied here too —
+    a payload round-tripped through this file hashes identically to the
+    original, which is what makes :func:`load_records_jsonl` output usable
+    with :func:`verify_chain` at all.
+    """
+    count = 0
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(
+                json.dumps(
+                    record_to_jsonable(record), sort_keys=True, ensure_ascii=False, default=_default
+                )
+            )
+            handle.write("\n")
+            count += 1
+    return count
+
+
+def load_records_jsonl(path: Path) -> list[AuditRecord]:
+    """Load records written by :func:`dump_records_jsonl`, in file order."""
+    records: list[AuditRecord] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(record_from_jsonable(json.loads(line)))
+    return records
+
+
+def records_to_json_bytes(records: Iterable[AuditRecord]) -> bytes:
+    """Render records as one JSON array — the wire shape for ``GET /audit``.
+
+    Same normalisation as :func:`dump_records_jsonl`; the counterpart is
+    :func:`records_from_json_bytes`, used by ``atrader verify-audit`` when it
+    fetches from a running process instead of an offline export.
+    """
+    return json.dumps(
+        [record_to_jsonable(record) for record in records],
+        sort_keys=True,
+        ensure_ascii=False,
+        default=_default,
+    ).encode("utf-8")
+
+
+def records_from_json_bytes(data: bytes) -> list[AuditRecord]:
+    return [record_from_jsonable(item) for item in json.loads(data)]
