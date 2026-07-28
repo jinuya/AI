@@ -1,0 +1,170 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atrader"
+version = "0.1.0"
+description = "AI trading agent — safety-first automated trading system"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "structlog>=24.1",
+    "sqlalchemy>=2.0",
+    "typer>=0.12",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "prometheus-client>=0.20",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.40"]
+postgres = ["asyncpg>=0.29", "alembic>=1.13"]
+redis = ["redis>=5.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.100",
+    "mypy>=1.11",
+    "ruff>=0.6",
+    "import-linter>=2.0",
+    "types-PyYAML",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+atrader = "atrader.app.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atrader"]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",      # pycodestyle / pyflakes
+    "I",                # isort
+    "N",                # pep8-naming
+    "UP",               # pyupgrade
+    "B",                # bugbear
+    "C4",               # comprehensions
+    "SIM",              # simplify
+    "RUF",
+    "ASYNC",
+    "DTZ",              # naive datetime usage
+]
+ignore = [
+    "E501",   # line length handled by formatter
+    "B008",   # typer uses function calls in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["N802", "N803"]
+
+# ---------------------------------------------------------------------------
+# mypy — strict is a CI gate (spec §4.1)
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+show_error_codes = true
+mypy_path = "src"
+packages = ["atrader"]
+
+[[tool.mypy.overrides]]
+module = ["anthropic.*", "redis.*", "asyncpg.*", "prometheus_client.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+markers = [
+    "integration: requires external infrastructure (Postgres/Redis). Opt-in only.",
+    "live_llm: performs a real Anthropic API call. Requires ANTHROPIC_API_KEY.",
+    "slow: long-running benchmark or soak test.",
+]
+filterwarnings = ["error::DeprecationWarning:atrader.*"]
+
+[tool.coverage.run]
+source = ["src/atrader"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+    "\\.\\.\\.",
+]
+
+# ---------------------------------------------------------------------------
+# import-linter — spec §7.1 / §12-1: no code path may bypass the risk engine.
+# Verified statically; also asserted in tests/unit/test_import_boundaries.py
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_package = "atrader"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Strategies cannot reach the broker or the execution layer"
+type = "forbidden"
+source_modules = ["atrader.strategy"]
+forbidden_modules = ["atrader.brokers", "atrader.execution"]
+
+[[tool.importlinter.contracts]]
+name = "Strategies cannot import the risk engine (they are gated by it, not users of it)"
+type = "forbidden"
+source_modules = ["atrader.strategy"]
+forbidden_modules = ["atrader.risk"]
+
+[[tool.importlinter.contracts]]
+name = "Market data never depends on trading-side components"
+type = "forbidden"
+source_modules = ["atrader.marketdata"]
+forbidden_modules = [
+    "atrader.strategy",
+    "atrader.risk",
+    "atrader.execution",
+    "atrader.brokers",
+    "atrader.portfolio",
+]
+
+[[tool.importlinter.contracts]]
+name = "core is dependency-free"
+type = "forbidden"
+source_modules = ["atrader.core"]
+forbidden_modules = [
+    "atrader.config",
+    "atrader.bus",
+    "atrader.storage",
+    "atrader.audit",
+    "atrader.marketdata",
+    "atrader.features",
+    "atrader.strategy",
+    "atrader.portfolio",
+    "atrader.risk",
+    "atrader.execution",
+    "atrader.brokers",
+    "atrader.backtest",
+    "atrader.monitoring",
+    "atrader.app",
+]
