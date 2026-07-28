@@ -11,6 +11,8 @@ risk:
     daily_loss_limit_pct: 2.0
     max_drawdown_pct: 10.0
     min_cash_buffer_pct: 5.0
+    margin_warn_ratio: 1.2       # §FR-PF-04: 이 아래로 떨어지면 경고
+    margin_reduce_only_ratio: 1.1 # 이 아래로 떨어지면 축소 주문만 허용
 
   position:
     max_position_pct: 10.0

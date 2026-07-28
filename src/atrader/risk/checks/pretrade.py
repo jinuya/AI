@@ -52,6 +52,15 @@ def check_system_state(ctx: CheckContext) -> RiskCheckResult:
             "unresolved reconciliation break; local state disagrees with the broker",
             alert_level=AlertLevel.CRITICAL,
         )
+    if ctx.snapshot.margin_reduce_only and not ctx.reduce_only:
+        # Spec §FR-PF-04: below the maintenance-margin reduce-only threshold,
+        # only exposure-shrinking orders go out. Unlike the two rejections
+        # above, this one clears itself the moment margin recovers.
+        return reject(
+            name,
+            "account is under a margin call; only exposure-reducing orders are permitted",
+            alert_level=AlertLevel.CRITICAL,
+        )
 
     if ctx.reduce_only:
         # Liquidation must work in every state except a full halt — that is

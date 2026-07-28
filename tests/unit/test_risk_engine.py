@@ -263,6 +263,22 @@ class TestCheck01SystemState:
         assert not decision.approved
         assert "reconciliation break" in decision.reason
 
+    def test_a_margin_call_blocks_new_orders(self, engine: RiskEngine) -> None:
+        # Spec §FR-PF-04: below the reduce-only threshold, only exposure
+        # reduction is allowed — set by portfolio.margin.MarginMonitor.
+        decision = engine.evaluate(make_intent(), make_snapshot(margin_reduce_only=True))
+        assert not decision.approved
+        assert "margin call" in decision.reason
+
+    def test_a_margin_call_does_not_block_reducing_orders(self, engine: RiskEngine) -> None:
+        position = Position(symbol="AAPL", quantity=Decimal(50), avg_price=PRICE)
+        decision = engine.evaluate(
+            make_intent(side=Side.SELL, target_value=Decimal("10")),
+            make_snapshot(margin_reduce_only=True, positions={"AAPL": position}),
+            reduce_only=True,
+        )
+        assert decision.approved
+
 
 class TestCheck02Universe:
     def test_an_unknown_symbol_is_rejected_critically(self, engine: RiskEngine) -> None:

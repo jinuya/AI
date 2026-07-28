@@ -64,6 +64,21 @@ class AccountLimits(_Base):
     daily_loss_limit_pct: Pct = Decimal("2.0")
     max_drawdown_pct: Pct = Decimal("10.0")
     min_cash_buffer_pct: Pct = Decimal("5.0")
+    margin_warn_ratio: PositiveDecimal = Decimal("1.2")
+    """Spec §FR-PF-04: equity/maintenance-margin below this warns."""
+    margin_reduce_only_ratio: PositiveDecimal = Decimal("1.1")
+    """Below this, new orders that grow exposure are refused — only reducing
+    fills are accepted, same exemption logic as the pre-trade loss checks."""
+
+    @model_validator(mode="after")
+    def _margin_thresholds_are_ordered(self) -> AccountLimits:
+        if self.margin_reduce_only_ratio >= self.margin_warn_ratio:
+            raise ValueError(
+                f"margin_reduce_only_ratio ({self.margin_reduce_only_ratio}) must be below "
+                f"margin_warn_ratio ({self.margin_warn_ratio}) — reduce-only is the more "
+                "severe state and must trigger at a lower ratio"
+            )
+        return self
 
 
 class PositionLimits(_Base):

@@ -68,6 +68,11 @@ class RiskSnapshot:
     kill_switch_engaged: bool = False
     reconciliation_break: bool = False
     """Spec §FR-EXE-05. Blocks new orders until a human resolves it."""
+    margin_reduce_only: bool = False
+    """Spec §FR-PF-04. Set by :class:`~atrader.portfolio.margin.MarginMonitor`
+    when equity falls below the maintenance-margin reduce-only threshold.
+    Unlike ``reconciliation_break``, this clears itself once margin recovers —
+    see the module docstring in ``portfolio.margin`` for why."""
 
     def position_of(self, symbol: str) -> Position:
         return self.positions.get(symbol) or Position(symbol=symbol)
