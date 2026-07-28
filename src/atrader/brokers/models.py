@@ -116,6 +116,7 @@ class BrokerEvent:
     quantity: Decimal | None = None
     price: Decimal | None = None
     commission: Decimal = Decimal(0)
+    tax: Decimal = Decimal(0)
     status: OrderStatus | None = None
     reason: str = ""
     at_ns: int = 0

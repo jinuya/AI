@@ -246,6 +246,7 @@ class OrderManager:
             quantity=event.quantity,
             price=event.price,
             commission=event.commission,
+            tax=event.tax,
             executed_at_ns=event.at_ns or now_ns,
         )
 

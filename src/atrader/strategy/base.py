@@ -13,8 +13,13 @@ never touches the broker" rule from spec §1 made mechanically unbypassable
 rather than merely documented).
 
 :class:`StrategyContext` is the strategy's entire view of the world: current
-positions, account state, and point-in-time features. No broker handle, no
-risk config, nothing the strategy could use to act rather than merely decide.
+positions, account state, point-in-time features, and an
+:class:`~atrader.core.ids.IdGenerator` — deliberately included, because the
+alternative is a strategy reaching for ``uuid.uuid4()`` to stamp a
+:class:`~atrader.core.models.TradingIntent`'s ``intent_id``, which silently
+breaks replay determinism (spec §2.2): that id flows straight into
+``Order.parent_intent_id``, so a strategy that generates its own ids makes
+two identical backtest runs diverge from the very first order.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
 
+from atrader.core.ids import IdGenerator
 from atrader.core.models import AccountState, Fill, Position, TradingIntent
 from atrader.features.store import FeatureValue
 from atrader.marketdata.models import Bar
@@ -48,6 +54,9 @@ class StrategyContext:
     account: AccountState
     positions: dict[str, Position]
     features: FeatureView
+    ids: IdGenerator
+    """The only source a strategy should use for any id it needs to mint —
+    most commonly ``TradingIntent.intent_id``."""
 
     def position_of(self, symbol: str) -> Position:
         return self.positions.get(symbol) or Position(symbol=symbol)
