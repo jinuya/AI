@@ -375,6 +375,18 @@ class ExecutionConfig(_Base):
     circuit_breaker_open_seconds: Annotated[int, Field(gt=0)] = 30
     cost_basis_method: CostBasisMethod = CostBasisMethod.FIFO
     rebalance_deadband_pct: Pct = Decimal("0.5")
+    default_algo: Literal["twap", "vwap", "pov"] = "twap"
+    """Which execution algorithm splits an order once it crosses
+    ``order.adv_split_threshold_pct``. TWAP is the default because it needs
+    nothing but a duration — no volume curve, no live tape."""
+    algo_slice_count: Annotated[int, Field(gt=0)] = 10
+    algo_duration_seconds: Annotated[int, Field(gt=0)] = 1800
+    """How long a TWAP/VWAP schedule is worked over, by default: 30 minutes."""
+    pov_participation_rate_pct: Pct = Decimal("10")
+    """Share of *incremental* observed volume a POV slice claims. Distinct from
+    ``order.max_adv_participation_pct`` (§7.2 #7), which bounds the order's
+    total size against the *day's* ADV — this bounds the rate of one slice
+    against volume as it prints."""
 
 
 class MarketDataConfig(_Base):
