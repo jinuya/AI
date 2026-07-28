@@ -1,0 +1,32 @@
+# 거래 가능 심볼 화이트리스트.
+#
+# 여기에 없는 심볼은 리스크 엔진이 무조건 거부하고 CRITICAL 알림을 낸다(§7.2 #2).
+# LLM 이 없는 티커를 만들어냈을 때 그게 거래소까지 가지 않게 하는 마지막 방어선이다.
+# 신규 심볼 최초 거래는 사람 승인이 필요하다(§7.6).
+
+universe:
+  symbols:
+    - AAPL
+    - MSFT
+    - NVDA
+    - AMZN
+    - GOOGL
+    - JPM
+    - XOM
+    - JNJ
+    - SPY
+    - QQQ
+
+  # 섹터 집중도 체크(§7.2 #9)용. 여기 없는 심볼은 UNKNOWN 버킷으로 들어가며,
+  # UNKNOWN 이 한 덩어리로 커지면 사실상 집중도 관리가 안 되는 상태다.
+  sectors:
+    AAPL: TECHNOLOGY
+    MSFT: TECHNOLOGY
+    NVDA: TECHNOLOGY
+    AMZN: CONSUMER_DISCRETIONARY
+    GOOGL: COMMUNICATION_SERVICES
+    JPM: FINANCIALS
+    XOM: ENERGY
+    JNJ: HEALTHCARE
+    SPY: INDEX_ETF
+    QQQ: INDEX_ETF

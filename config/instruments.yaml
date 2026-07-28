@@ -1,0 +1,147 @@
+# InstrumentSpec 마스터(§FR-PF-05).
+#
+# 자산군마다 거래시간·결제주기·계약승수·최소호가단위가 다르다. 주문 가격을
+# 호가단위에 맞추고 수량을 최소단위로 내림하려면 이 표가 먼저 있어야 한다.
+# 거래시간은 UTC. 미국 정규장 09:30–16:00 ET = 14:30–21:00 UTC (EDT 기준).
+
+instruments:
+  - symbol: AAPL
+    asset_class: EQUITY
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: TECHNOLOGY
+    exchange: NASDAQ
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.5
+    tax_bps: 0
+    borrow_bps_annual: 25
+
+  - symbol: MSFT
+    asset_class: EQUITY
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: TECHNOLOGY
+    exchange: NASDAQ
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.5
+    borrow_bps_annual: 25
+
+  - symbol: NVDA
+    asset_class: EQUITY
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: TECHNOLOGY
+    exchange: NASDAQ
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.5
+    borrow_bps_annual: 60
+
+  - symbol: AMZN
+    asset_class: EQUITY
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: CONSUMER_DISCRETIONARY
+    exchange: NASDAQ
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.5
+    borrow_bps_annual: 30
+
+  - symbol: GOOGL
+    asset_class: EQUITY
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: COMMUNICATION_SERVICES
+    exchange: NASDAQ
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.5
+    borrow_bps_annual: 25
+
+  - symbol: JPM
+    asset_class: EQUITY
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: FINANCIALS
+    exchange: NYSE
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.5
+    borrow_bps_annual: 20
+
+  - symbol: XOM
+    asset_class: EQUITY
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: ENERGY
+    exchange: NYSE
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.5
+    borrow_bps_annual: 20
+
+  - symbol: JNJ
+    asset_class: EQUITY
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: HEALTHCARE
+    exchange: NYSE
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.5
+    borrow_bps_annual: 15
+
+  - symbol: SPY
+    asset_class: ETF
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: INDEX_ETF
+    exchange: ARCA
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.3
+    borrow_bps_annual: 10
+
+  - symbol: QQQ
+    asset_class: ETF
+    tick_size: 0.01
+    lot_size: 1
+    currency: USD
+    sector: INDEX_ETF
+    exchange: NASDAQ
+    settlement_days: 1
+    market_open_utc: "14:30"
+    market_close_utc: "21:00"
+    shortable: true
+    commission_bps: 0.3
+    borrow_bps_annual: 10

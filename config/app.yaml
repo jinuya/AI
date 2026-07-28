@@ -1,0 +1,45 @@
+# 애플리케이션 전역 설정.
+# 리스크 한도는 risk.yaml 에만 존재한다 — 여기에 두면 리뷰 경계가 흐려진다.
+
+environment: dev
+account_equity: 100000
+base_currency: USD
+
+execution:
+  default_order_type: LIMIT
+  reconciliation_interval_seconds: 30    # §FR-EXE-05: 최소 30초 주기
+  deadman_timeout_seconds: 60            # §FR-MON-04
+  cancel_before_close_minutes: 10        # §FR-EXE-06
+  rate_limit_per_minute: 200
+  rate_limit_burst: 20
+  rate_limit_reserve_pct: 20             # §6.3: 긴급 취소용 예약분
+  max_retries: 5
+  circuit_breaker_failures: 5
+  circuit_breaker_open_seconds: 30
+  cost_basis_method: FIFO                # 세무 보고와 일치해야 한다
+  rebalance_deadband_pct: 0.5
+
+market_data:
+  primary_source: simulated
+  backup_source: null
+  bar_intervals: ["1m", "5m", "1h", "1d"]
+  reconnect_base_seconds: 1
+  reconnect_max_seconds: 60
+  reconnect_jitter_pct: 20               # 지터 없으면 전 인스턴스가 동시에 재접속한다
+  backfill_on_reconnect: true
+
+storage:
+  # 기본은 파일 기반 SQLite. Postgres 로 바꾸려면 ATRADER_STORAGE_DSN 으로 덮어쓴다.
+  dsn: "sqlite+pysqlite:///atrader.db"
+  echo_sql: false
+
+bus:
+  backend: memory                        # memory | redis
+  url: null
+  consumer_group: atrader
+
+monitoring:
+  log_level: INFO
+  metrics_port: 9090
+  heartbeat_interval_seconds: 10
+  approval_timeout_seconds: 300          # §7.6: 5분 무응답 시 자동 거부

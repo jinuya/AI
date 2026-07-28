@@ -1,0 +1,26 @@
+# 전략 정의와 자본 배분.
+#
+# 모든 전략은 enabled: false 로 시작한다. 승격은 §8.5의 게이트를 순서대로 통과해야
+# 한다: 백테스트 → 페이퍼 30일 → 소액 실거래 30일 → 단계적 증액.
+# 어느 단계에서든 MDD 한도 초과 시 즉시 이전 단계로 강등한다.
+
+strategies:
+  - strategy_id: sma_crossover
+    version: "1"
+    enabled: true
+    capital_allocation_pct: 50
+    universe: [AAPL, MSFT, NVDA, AMZN, GOOGL, JPM, XOM, JNJ]
+    params:
+      fast_period: 20
+      slow_period: 50
+      volume_multiple: 1.8       # 거래량이 평균의 이 배수 이상일 때만 진입
+      min_bars: 60               # 워밍업. 이전에는 어떤 의도도 내지 않는다
+
+  - strategy_id: llm_agent
+    version: "1"
+    enabled: false               # §8.5 게이트를 통과하기 전까지 비활성
+    capital_allocation_pct: 0
+    universe: [AAPL, MSFT, NVDA, SPY]
+    params:
+      lookback_bars: 30
+      include_news: false        # 외부 텍스트는 프롬프트 인젝션 표면이다(§FR-MD-06)

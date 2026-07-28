@@ -1,0 +1,86 @@
+# 리스크 한도 — 사양서 §13 부록
+#
+# 이 파일의 변경은 반드시 코드 리뷰를 거치는 PR로만 이루어진다(§4.6).
+# 승인자 2명 필수(§10.5). 런타임에 임의로 올릴 수 있으면 그건 한도가 아니다.
+#
+# 환경변수로 이 값들을 덮어쓸 수 없다 — ATRADER_RISK_* 는 로더가 거부한다.
+
+risk:
+  account:
+    max_leverage: 1.0            # 1.0 = 현금거래
+    daily_loss_limit_pct: 2.0
+    max_drawdown_pct: 10.0
+    min_cash_buffer_pct: 5.0
+
+  position:
+    max_position_pct: 10.0
+    max_sector_pct: 30.0
+    max_correlated_exposure_pct: 25.0
+    correlation_threshold: 0.7
+
+  order:
+    max_order_notional_pct: 2.0
+    max_adv_participation_pct: 5.0
+    limit_price_deviation_pct: 5.0     # fat-finger
+    max_orders_per_minute: 30
+    duplicate_window_seconds: 5
+    human_approval_threshold_pct: 10.0
+    adv_split_threshold_pct: 1.0       # 이 비율 초과 시 분할 집행 필수(§FR-EXE-03)
+    allow_market_orders: false         # §FR-EXE-02: 시장가는 기본 비활성
+    aggressive_limit_ticks: 2
+
+  sizing:
+    method: volatility_target          # fixed | volatility_target | kelly
+    risk_per_trade_pct: 0.5
+    atr_multiple: 2.0
+    kelly_fraction: 0.25               # fractional Kelly 상한. 풀 켈리는 파산 확률이 높다
+
+  stops:
+    hard_stop_atr_multiple: 2.0
+    trailing_stop_atr_multiple: 3.0
+    time_stop_bars: 20
+    place_at_broker: true              # 우리 시스템이 죽어도 보호가 남도록
+
+  circuit_breaker:
+    l1_daily_loss_pct: 1.0
+    l1_cooldown_minutes: 30
+    l1_auto_recover: true
+    l1_consecutive_losses: 3
+    l1_consecutive_window_minutes: 5
+    l2_daily_loss_pct: 2.0
+    l2_max_drawdown_pct: 7.0
+    l2_auto_recover: false             # 의도적으로 false. 사람이 확인해야 한다
+    l3_daily_loss_pct: 3.0
+    l3_max_drawdown_pct: 10.0
+    l3_liquidate_all: true
+    anomaly_order_rate_multiple: 5.0
+    anomaly_roundtrip_count: 4
+
+  llm:
+    # 모델 버전 핀 고정(§7.7). 별칭 금지 — 이 문자열은 KNOWN_MODEL_IDS 허용목록에
+    # 있어야 하며, 없으면 부팅이 거부된다.
+    model: "claude-opus-5"
+
+    # 사양서 §13은 temperature: 0 을 요구하지만, 현재 Claude 모델군에서는
+    # temperature/top_p/seed 가 제거되어 전송 시 400이 반환된다. 따라서 설정하지
+    # 않는다 — 설정하면 로더가 거부한다. 재현성은 RecordedLLMClient(녹화/재생)로
+    # 확보한다. 자세한 내용은 docs/llm-determinism.md 참고.
+    # temperature: 0        # ← 사용 불가. 주석을 풀면 부팅이 거부된다.
+    effort: medium          # temperature 를 대신하는 사고 깊이/비용 제어
+
+    max_tokens: 8000
+    min_confidence: 0.6
+    schema_retry: 1
+    require_symbol_whitelist: true
+    log_full_prompts: true
+    enable_refusal_fallback: false
+    variance_alert_threshold: 0.2
+    allow_unknown_model: false
+
+  data_quality:
+    max_feed_lag_ms: 1000
+    stale_threshold_seconds: 30
+    price_jump_threshold_pct: 20.0
+    dual_source_divergence_pct: 0.5
+    max_sequence_gap: 0
+    clock_drift_alert_ms: 100
