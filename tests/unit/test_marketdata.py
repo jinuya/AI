@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -9,7 +11,8 @@ import pytest
 from pydantic import ValidationError
 
 from atrader.config.schema import DataQualityConfig
-from atrader.core.clock import NS_PER_SECOND, SimulatedClock
+from atrader.core.clock import NS_PER_SECOND, SimulatedClock, SystemClock
+from atrader.core.errors import DataQualityError
 from atrader.core.types import DataQuality
 from atrader.marketdata.aggregator import BarAggregator, interval_to_ns
 from atrader.marketdata.feeds.dual_source import DualSourceMonitor, choose_active_feed
@@ -510,3 +513,132 @@ class TestChooseActiveFeed:
             stale_after_seconds=10,
         )
         assert chosen is primary
+
+
+class TestReadTicksErrorContract:
+    """``read_ticks`` promises ``DataQualityError`` with the file and line
+    number — the module docstring's whole argument for JSONL is that a replay
+    that disagrees with the original stays findable. Two common corruption
+    shapes used to escape that contract: ``decimal.InvalidOperation``
+    subclasses ``ArithmeticError`` rather than ``ValueError``, and a line that
+    decodes to something other than an object reached ``.get`` on a non-dict.
+    Callers that fail closed on ``DataQualityError`` saw neither.
+    """
+
+    def _write(self, path: Path, bad_line: str) -> Path:
+        good = json.dumps(
+            {
+                "symbol": "AAPL",
+                "exchange_ts": 1,
+                "ingest_ts": 2,
+                "last": "100",
+                "last_size": "1",
+                "seq": 1,
+            }
+        )
+        path.write_text(f"{good}\n{bad_line}\n", encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize(
+        ("label", "bad_line"),
+        [
+            (
+                "a price that is not a number",
+                json.dumps(
+                    {
+                        "symbol": "AAPL",
+                        "exchange_ts": 1,
+                        "ingest_ts": 2,
+                        "last": "abc",
+                        "last_size": "1",
+                        "seq": 1,
+                    }
+                ),
+            ),
+            ("a JSON array", "[1, 2, 3]"),
+            ("a bare number", "42"),
+            ("a JSON null", "null"),
+            ("a bare string", '"hello"'),
+            ("malformed JSON", "{not json"),
+        ],
+    )
+    def test_every_corruption_shape_raises_data_quality_error(
+        self, tmp_path: Path, label: str, bad_line: str
+    ) -> None:
+        path = self._write(tmp_path / "recording.jsonl", bad_line)
+        with pytest.raises(DataQualityError):
+            read_ticks(path)
+
+    @pytest.mark.parametrize(
+        ("label", "bad_line"),
+        [
+            ("a price that is not a number", '{"symbol": "A", "last": "abc"}'),
+            ("a JSON array", "[]"),
+        ],
+    )
+    def test_the_offending_line_number_is_reported(
+        self, tmp_path: Path, label: str, bad_line: str
+    ) -> None:
+        """Without this the operator has a corrupt recording and no idea
+        where — which is the diagnostic the format was chosen for."""
+        path = self._write(tmp_path / "recording.jsonl", bad_line)
+        with pytest.raises(DataQualityError, match="line 2"):
+            read_ticks(path)
+
+    def test_a_valid_recording_still_round_trips(self, tmp_path: Path) -> None:
+        path = tmp_path / "recording.jsonl"
+        original = [tick(seq=1), tick(seq=2, last=Decimal("187.60"))]
+        write_ticks(path, original)
+        assert read_ticks(path) == original
+
+
+class TestSimulatedFeedCadence:
+    """Against a real clock the emission rate has to be real too.
+
+    ``_step`` applies one ``interval_ns`` of price diffusion per tick. With a
+    ``SimulatedClock`` the loop advances that clock, so the two agree. With a
+    real clock there was nothing pacing the loop: it spun as fast as the event
+    loop allowed — measured at ~62,000 ticks per second for a one-second
+    interval — while every one of those ticks moved the price as though a full
+    second had elapsed. A minute bar built from that has an intrabar range of
+    tens of percent, tripping the fat-finger and price-jump checks on pure
+    artifact.
+    """
+
+    async def test_a_real_clock_paces_the_loop(self) -> None:
+        feed = SimulatedFeed.from_symbols(
+            ["AAPL"], clock=SystemClock(), interval_ns=NS_PER_SECOND // 20
+        )
+        await feed.connect(["AAPL"])
+
+        started = time.monotonic()
+        emitted = 0
+        async for _ in feed:
+            emitted += 1
+            if time.monotonic() - started > 0.5:
+                break
+        await feed.close()
+
+        # ~10 expected at 50ms cadence over 0.5s. The bound that matters is
+        # the upper one: before the fix this was in the tens of thousands.
+        assert emitted < 100, f"feed is not pacing itself: {emitted} ticks in 0.5s"
+        assert emitted >= 2, "feed produced almost nothing; it should still tick"
+
+    async def test_a_simulated_clock_is_not_slowed_down(self) -> None:
+        """Backtests must stay instant — the pacing applies only to real time."""
+        clock = SimulatedClock(start_ns=BASE_NS)
+        feed = SimulatedFeed.from_symbols(["AAPL"], clock=clock, interval_ns=NS_PER_SECOND)
+        await feed.connect(["AAPL"])
+
+        started = time.monotonic()
+        emitted = 0
+        async for _ in feed:
+            emitted += 1
+            if emitted >= 500:
+                break
+        await feed.close()
+
+        assert time.monotonic() - started < 2.0, "a simulated clock must not sleep"
+        # emitted - 1, not emitted: the generator is suspended at the yield of
+        # the last tick, so that round's clock advance has not run yet.
+        assert clock.now_ns() == BASE_NS + (emitted - 1) * NS_PER_SECOND

@@ -14,6 +14,7 @@ data that keeps moving.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -163,7 +164,19 @@ class SimulatedFeed:
                 self._ticks_emitted += 1
                 yield self._step(sim)
             if isinstance(self._clock, SimulatedClock):
+                # Backtest speed: jump the clock, no waiting.
                 self._clock.advance(self._interval_ns)
+            else:
+                # Against a real clock the cadence has to be real too. Without
+                # this the loop spins as fast as the event loop allows while
+                # ``_step`` keeps applying a full interval of diffusion per
+                # tick — measured at ~62,000 ticks/second for a 1s interval,
+                # every one of them landing in the same bar and moving the
+                # price as though a second had elapsed. A minute bar built
+                # from that has an intrabar range of tens of percent, which
+                # trips the fat-finger and price-jump checks on pure artifact
+                # and makes every volatility estimate meaningless.
+                await asyncio.sleep(self._interval_ns / NS_PER_SECOND)
 
     def __aiter__(self) -> AsyncIterator[Tick]:
         return self._iterate()

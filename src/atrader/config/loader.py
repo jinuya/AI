@@ -101,6 +101,32 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def load_required_yaml(path: Path) -> dict[str, Any]:
+    """Parse a YAML mapping that must actually contain something.
+
+    A required file that exists but is empty — a truncated write, a mounted
+    ConfigMap with no data, a template that rendered to nothing — reaches
+    :func:`load_yaml` as ``{}``, and ``{}`` validates cleanly into a model
+    made entirely of defaults. That is the "carry on with defaults" path this
+    module's docstring says does not exist: the process would boot, report no
+    error, and trade against limits nobody wrote.
+
+    ``is_file()`` cannot tell those cases apart from a real config, so the
+    emptiness check has to live here. Optional files are deliberately exempt —
+    an empty ``universe.yaml`` genuinely is a no-op, and only the required
+    ones carry limits.
+    """
+    data = load_yaml(path)
+    if not data:
+        raise ConfigError(
+            f"{path} exists but is empty. A required config file with no content is "
+            "treated the same as a missing one: every value would silently fall back "
+            "to a code default nobody approved (spec §7.1). If this file was written "
+            "by a template or mounted from a ConfigMap, check that it rendered."
+        )
+    return data
+
+
 def _set_path(tree: dict[str, Any], dotted: str, value: str) -> None:
     parts = dotted.split(".")
     cursor = tree
@@ -153,10 +179,10 @@ def load_risk_config(config_dir: Path) -> RiskConfig:
             f"{path} is required and missing. The system refuses to boot without risk "
             "limits rather than trading with defaults nobody approved (spec §7.1)."
         )
-    data = load_yaml(path)
+    data = load_required_yaml(path)
     block = data.get("risk", data)
-    if not isinstance(block, dict):
-        raise ConfigError(f"{path}: 'risk' must be a mapping")
+    if not isinstance(block, dict) or not block:
+        raise ConfigError(f"{path}: 'risk' must be a non-empty mapping")
     try:
         return RiskConfig.model_validate(block)
     except ValidationError as exc:
@@ -194,7 +220,7 @@ def load_app_config(config_dir: Path, *, environ: dict[str, str] | None = None) 
         path = config_dir / name
         if not path.is_file():
             continue
-        content = load_yaml(path)
+        content = load_required_yaml(path) if name in REQUIRED_FILES else load_yaml(path)
         overlapping = sorted(set(content) & set(tree))
         if overlapping:
             raise ConfigError(

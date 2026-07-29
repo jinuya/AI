@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Iterable, Sequence
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -42,11 +42,24 @@ def _tick_to_json(tick: Tick) -> dict[str, Any]:
     return data
 
 
-def _tick_from_json(data: dict[str, Any]) -> Tick:
+def _tick_from_json(data: Any) -> Tick:
+    # Typed ``Any`` rather than ``dict``: the caller hands over whatever
+    # ``json.loads`` produced, and a corrupt recording can legitimately
+    # contain a line that is a list, a bare number, or ``null``. Declaring a
+    # dict here would only move the failure to an AttributeError below.
+    if not isinstance(data, dict):
+        raise ValueError(f"expected a JSON object, got {type(data).__name__}")
     for field in _DECIMAL_FIELDS:
         value = data.get(field)
         if value is not None:
-            data[field] = Decimal(str(value))
+            try:
+                data[field] = Decimal(str(value))
+            except InvalidOperation as exc:
+                # InvalidOperation subclasses ArithmeticError, not ValueError,
+                # so it would otherwise escape read_ticks' except clause and
+                # reach the caller without the file and line number that make
+                # a corrupt recording findable.
+                raise ValueError(f"{field}={value!r} is not a number") from exc
     return Tick.model_validate(data)
 
 

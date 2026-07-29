@@ -174,8 +174,14 @@ class OrderRequest(_Record):
             raise ValueError(f"{self.order_type} requires a limit_price")
         if needs_stop and self.stop_price is None:
             raise ValueError(f"{self.order_type} requires a stop_price")
+        # Both directions, symmetrically. A stray price on an order type that
+        # does not use it is not harmless decoration: this request goes
+        # straight to a broker adapter, and a broker that honours the extra
+        # field executes something other than what the risk engine approved.
         if not needs_limit and self.limit_price is not None:
             raise ValueError(f"{self.order_type} must not carry a limit_price")
+        if not needs_stop and self.stop_price is not None:
+            raise ValueError(f"{self.order_type} must not carry a stop_price")
         for name, price in (("limit_price", self.limit_price), ("stop_price", self.stop_price)):
             if price is not None and price <= 0:
                 raise ValueError(f"{name} must be positive, got {price}")

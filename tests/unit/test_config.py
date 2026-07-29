@@ -223,3 +223,71 @@ class TestImmutability:
         config = load_app_config(REPO_CONFIG, environ={})
         with pytest.raises(ValidationError):
             config.risk.account.daily_loss_limit_pct = Decimal(50)  # type: ignore[misc]
+
+
+class TestAnEmptyRequiredFileIsNotAConfig:
+    """A required config file that exists but is empty is the same failure as
+    a missing one, and a more dangerous one: ``is_file()`` passes, every value
+    falls back to a code default, and the process boots reporting nothing
+    wrong. Spec §7.1 and this module's own docstring both say there is no
+    "carry on with defaults" path — this pins that shut.
+
+    Real triggers are ordinary: a truncated write, a mounted ConfigMap with no
+    data, a template that rendered to nothing.
+    """
+
+    @pytest.mark.parametrize(
+        ("label", "content"),
+        [
+            ("zero bytes", ""),
+            ("only whitespace", "\n\n   \n"),
+            ("only a comment", "# TODO: fill in the limits\n"),
+            ("the risk key with no body", "risk:\n"),
+        ],
+    )
+    def test_load_risk_config_refuses(self, tmp_path: Path, label: str, content: str) -> None:
+        (tmp_path / "risk.yaml").write_text(content, encoding="utf-8")
+        with pytest.raises(ConfigError):
+            load_risk_config(tmp_path)
+
+    @pytest.mark.parametrize(
+        ("label", "content"),
+        [
+            ("zero bytes", ""),
+            ("only a comment", "# TODO: fill in the limits\n"),
+            ("the risk key with no body", "risk:\n"),
+        ],
+    )
+    def test_load_app_config_refuses(self, tmp_path: Path, label: str, content: str) -> None:
+        (tmp_path / "risk.yaml").write_text(content, encoding="utf-8")
+        with pytest.raises(ConfigError):
+            load_app_config(tmp_path, environ={})
+
+    def test_the_error_says_the_file_is_empty_not_that_it_is_missing(self, tmp_path: Path) -> None:
+        """An operator chasing "required config file is missing" will look in
+        the wrong place when the file is right there."""
+        (tmp_path / "risk.yaml").write_text("", encoding="utf-8")
+        with pytest.raises(ConfigError, match="exists but is empty"):
+            load_risk_config(tmp_path)
+
+    def test_an_empty_optional_file_is_still_a_legitimate_no_op(self, tmp_path: Path) -> None:
+        """Only required files carry limits. An empty universe.yaml means
+        'no universe overrides', which is a real configuration."""
+        (tmp_path / "risk.yaml").write_text(
+            "risk:\n  account:\n    max_leverage: 1.0\n", encoding="utf-8"
+        )
+        (tmp_path / "universe.yaml").write_text("", encoding="utf-8")
+        assert load_app_config(tmp_path, environ={}) is not None
+
+    def test_a_real_config_still_loads(self, tmp_path: Path) -> None:
+        """The guard must not have made the loader reject valid input.
+
+        3.0 rather than a tighter figure because the schema also enforces that
+        circuit-breaker L2 fires *before* the account daily loss limit — a
+        limit below the L2 default would be rejected by that cross-field rule
+        instead, which would make this test pass for the wrong reason.
+        """
+        (tmp_path / "risk.yaml").write_text(
+            "risk:\n  account:\n    daily_loss_limit_pct: 3.0\n", encoding="utf-8"
+        )
+        assert load_risk_config(tmp_path).account.daily_loss_limit_pct == Decimal("3.0")
