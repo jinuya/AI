@@ -74,9 +74,20 @@ class CorporateAction:
                     "(the close before the ex-date)"
                 )
             return (self.reference_price - self.cash_amount) / self.reference_price
-        # Mergers and spin-offs need instrument-specific handling; treating them
-        # as a no-op would be quietly wrong, so callers must supply a ratio.
-        return self.ratio if self.ratio > ZERO else ONE
+        # Mergers and spin-offs carry an exchange ratio rather than a split
+        # factor, so it is applied directly. The default of 1 is a real answer
+        # here in a way it is not for a split: a 1-for-1 exchange leaves price
+        # continuity intact and needs no adjustment.
+        #
+        # A non-positive ratio is not an answer, though — it is bad reference
+        # data. Substituting 1 would hide it behind a series that looks
+        # adjusted, which is the same failure the dividend branch above
+        # refuses to commit.
+        if self.ratio <= ZERO:
+            raise ValueError(
+                f"{self.action_type} ratio for {self.symbol} must be positive, got {self.ratio}"
+            )
+        return self.ratio
 
     def volume_factor(self) -> Decimal:
         """Multiplier for historical volume. Only splits change share counts."""

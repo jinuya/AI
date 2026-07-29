@@ -5,10 +5,24 @@ lower; the :class:`~atrader.bus.protocol.MessageBus` Protocol is what makes
 swapping it later a contained change.
 
 **Not exercised by the default test suite.** There is no Redis in the standard
-development environment, so these paths run only under ``pytest -m integration``
-against a real server. The in-memory bus deliberately mirrors the semantics that
-matter — consumer groups, explicit acks, redelivery, oldest-first drops under
-backpressure — so logic written against it does not discover surprises here.
+development environment, so the client paths run only under
+``pytest -m integration`` against a real server. The in-memory bus mirrors the
+*delivery* semantics — consumer groups, explicit acks, redelivery,
+oldest-first drops under backpressure — so logic written against it does not
+discover surprises in those.
+
+It does **not** mirror payload semantics, and the difference is a trap worth
+stating plainly. The in-memory bus stores the payload dict by reference, so a
+``Decimal`` goes in and a ``Decimal`` comes out. This backend serializes with
+``json.dumps(..., default=str)``, so anything JSON cannot represent natively
+arrives at the consumer as a **string**. A handler that does arithmetic
+directly on ``payload["price"]`` will pass every in-memory test and raise
+``TypeError`` here. Values survive exactly — ``default=str`` never goes
+through float — so the fix at a consumer is to reconstruct the type
+(``Decimal(payload["price"])``), not to change the encoding.
+
+``_encode``/``_decode`` need no server and are covered by
+``tests/unit/test_redis_wire_format.py``, including the divergence above.
 
 Streams are capped with ``MAXLEN ~`` rather than left to grow: an unbounded
 market-data stream will exhaust Redis memory in a single session, and the

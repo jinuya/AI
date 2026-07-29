@@ -231,6 +231,14 @@ uv run atrader divergence-report \
   (의도적으로 막지 않음 — 실패 방향이 "더 많이 허용"이라 안전 쪽으로 치우친 단순화다).
 - **저장소**: 기본은 인메모리(`InMemoryStorage`) — 프로세스가 죽으면 상태도 사라진다.
   SQL 리포지토리(`atrader.storage.sql`)는 구현되어 있으나 이 CLI가 아직 배선하지 않았다.
+- **메시지 버스**: 구현돼 있으나 **아직 아무 컴포넌트도 publish하지 않는다**. 이번
+  런타임은 컴포넌트를 직접 호출로 잇는다. 배선할 때 주의할 점 하나 —
+  `InMemoryBus`는 payload dict를 참조로 보관해 `Decimal`이 그대로 남지만,
+  `RedisStreamsBus`는 JSON 직렬화를 거쳐 **문자열로 도착한다**. `payload["price"]`에
+  바로 산술을 하는 핸들러는 인메모리 테스트를 전부 통과하고 Redis에서만 `TypeError`가
+  난다. 값 자체는 정확히 보존되므로(`default=str`, float 경유 없음) 소비자 쪽에서
+  `Decimal(payload["price"])`로 복원하는 게 올바른 대응이다. 이 발산은
+  `tests/unit/test_redis_wire_format.py`가 고정해 두었다.
 
 이 목록에 없는 것 — 리스크 게이트, 킬 스위치, 정합성 확인, 감사로그 해시체인, 주문
 멱등성 — 은 단순화 대상이 아니다. 각각 독립적으로 테스트되어 있고 이번 런타임에도
