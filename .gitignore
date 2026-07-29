@@ -6,6 +6,9 @@
 *.key
 credentials.json
 secrets.*
+# ...but `secrets.py` is the SecretProvider module, not a credential file.
+# Without this carve-out the rule above silently drops it from the repo.
+!**/secrets.py
 
 # --- macOS ---
 .DS_Store
