@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  check:
+    name: lint + types + imports + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.8.17"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras --locked
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy --strict
+        run: uv run mypy
+
+      # Acceptance criterion #1: no code path may bypass the risk engine.
+      - name: import-linter
+        run: uv run lint-imports
+
+      # Unit + property + replay + chaos + prompt-injection — everything
+      # that runs without external infrastructure or a live API key.
+      # Includes tests/unit/test_risk_coverage.py, which enforces the 95%
+      # risk-engine/state-machine coverage floor (acceptance criterion #2)
+      # via its own isolated subprocess run.
+      - name: pytest
+        run: >
+          uv run pytest -m "not integration and not live_llm and not slow"
+          --cov=atrader --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
