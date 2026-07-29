@@ -89,10 +89,29 @@ class IllegalStateTransitionError(ATraderError):
 # --------------------------------------------------------------------------
 # Risk
 # --------------------------------------------------------------------------
+#
+# ⚠ The three types in this section are **not raised anywhere in this
+# codebase**, and an ``except`` clause naming one of them will catch nothing.
+# That is by design, not oversight: a rejection, a kill switch and a pending
+# approval are all *normal outcomes* of evaluating an intent, so the risk
+# engine reports them by returning a
+# :class:`~atrader.risk.engine.RiskDecision` rather than by raising. Signalling
+# an ordinary decision with an exception would mean the caller could skip
+# handling it by not catching, which is the opposite of a gate.
+#
+# They are kept because they carry the right shape for a caller that does need
+# to raise — a future broker adapter or an RPC boundary translating a decision
+# into an error. Each docstring below says what actually carries the outcome
+# today, so nobody writes a dead handler.
 
 
 class RiskRejectionError(ATraderError):
-    """The risk engine refused an intent."""
+    """A refused intent, as an exception.
+
+    **Not raised by the risk engine.** ``RiskEngine.evaluate`` returns a
+    ``RiskDecision`` whose ``action`` is ``REJECT`` and whose ``reason`` names
+    the failing check; read that, do not catch this.
+    """
 
     def __init__(self, check_name: str, reason: str, *, intent_id: str | None = None) -> None:
         prefix = f"intent {intent_id}: " if intent_id else ""
@@ -103,11 +122,22 @@ class RiskRejectionError(ATraderError):
 
 
 class KillSwitchEngagedError(ATraderError):
-    """The kill switch is active; no new orders may be sent (spec §FR-MON-03)."""
+    """The kill switch is active; no new orders may be sent (spec §FR-MON-03).
+
+    **Not raised.** ``KillSwitch.is_engaged`` is the live flag, and the first
+    of the fifteen pre-trade checks turns it into a ``REJECT`` decision. The
+    switch has to block orders the instant it is flipped, which a boolean read
+    does and an exception thrown from somewhere else does not.
+    """
 
 
 class ApprovalRequiredError(ATraderError):
-    """A human must approve this action before it proceeds (spec §7.6)."""
+    """A human must approve this action before it proceeds (spec §7.6).
+
+    **Not raised.** The gate returns a decision whose ``action`` is ``QUEUE``
+    together with an ``approval_request_id``; the intent waits rather than
+    failing. Raising here would abort an intent that is merely pending.
+    """
 
     def __init__(self, request_id: str, reason: str) -> None:
         super().__init__(f"approval {request_id} required: {reason}")
@@ -170,6 +200,12 @@ class ReconciliationBreakError(ATraderError):
 
     The broker is the source of truth. New orders stop until a human resolves
     it; the system never auto-corrects.
+
+    **Not raised.** ``Reconciler.has_active_break`` is the live flag, and
+    ``check_system_state`` — the first of the fifteen pre-trade checks — turns
+    it into a ``REJECT``. The block has to hold for every subsequent intent
+    until a human clears it, which a persistent flag does and a one-shot
+    exception does not.
     """
 
     def __init__(self, kind: str, detail: str) -> None:

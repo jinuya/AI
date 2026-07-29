@@ -31,6 +31,7 @@ from atrader.config.schema import (
     UniverseConfig,
 )
 from atrader.core.clock import NS_PER_SECOND, SimulatedClock
+from atrader.core.errors import ApprovalTimeoutError
 from atrader.core.ids import DeterministicIdGenerator
 from atrader.core.models import AccountState, Position, TradingIntent
 from atrader.core.types import (
@@ -828,8 +829,37 @@ class TestApprovalGateTimeout:
         assert refreshed.status.value == "timed_out"
 
     def test_granting_after_the_timeout_is_refused(self, clock: SimulatedClock) -> None:
+        # ApprovalTimeoutError specifically, not bare Exception: a caller that
+        # catches this type is the point of having it, and `raises(Exception)`
+        # would stay green if a refactor started raising an AttributeError
+        # whose message happened to contain "already".
         gate = ApprovalGate(clock, DeterministicIdGenerator(clock), timeout_seconds=60)
         request = gate.request(ApprovalKind.LARGE_ORDER, "big trade")
         clock.advance(61 * NS_PER_SECOND)
-        with pytest.raises(Exception, match="already"):
+        with pytest.raises(ApprovalTimeoutError, match="already"):
             gate.grant(request.request_id, by="operator")
+
+    def test_granting_an_already_decided_request_is_refused_too(
+        self, clock: SimulatedClock
+    ) -> None:
+        """Not only expiry: a request someone already denied must not be
+        flipped to granted by a second click."""
+        gate = ApprovalGate(clock, DeterministicIdGenerator(clock), timeout_seconds=60)
+        request = gate.request(ApprovalKind.LARGE_ORDER, "big trade")
+        gate.deny(request.request_id, by="operator")
+        with pytest.raises(ApprovalTimeoutError, match="already"):
+            gate.grant(request.request_id, by="someone else")
+
+    def test_denying_a_settled_request_is_a_silent_no_op(self, clock: SimulatedClock) -> None:
+        """Deliberately asymmetric with grant. Denying something already
+        denied or timed out changes nothing and is harmless, so it returns the
+        request unchanged instead of raising; granting one is the dangerous
+        direction and is the one that refuses."""
+        gate = ApprovalGate(clock, DeterministicIdGenerator(clock), timeout_seconds=60)
+        request = gate.request(ApprovalKind.LARGE_ORDER, "big trade")
+        clock.advance(61 * NS_PER_SECOND)
+
+        settled = gate.deny(request.request_id, by="operator")
+
+        assert settled.status.value == "timed_out"
+        assert not gate.is_granted(request.request_id)
