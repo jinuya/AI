@@ -12,7 +12,8 @@ from atrader.config.schema import DataQualityConfig
 from atrader.core.clock import NS_PER_SECOND, SimulatedClock
 from atrader.core.types import DataQuality
 from atrader.marketdata.aggregator import BarAggregator, interval_to_ns
-from atrader.marketdata.feeds.dual_source import DualSourceMonitor
+from atrader.marketdata.feeds.dual_source import DualSourceMonitor, choose_active_feed
+from atrader.marketdata.feeds.protocol import FeedStatus
 from atrader.marketdata.feeds.replay import ReplayFeed, read_ticks, write_ticks
 from atrader.marketdata.feeds.simulated import SimulatedFeed
 from atrader.marketdata.models import Bar, Tick
@@ -378,3 +379,134 @@ class TestDualSourceDivergence:
             ingest_ts=BASE_NS + 60 * NS_PER_SECOND, bid=Decimal("300"), ask=Decimal("300.02")
         )
         assert dual.observe_backup(late) is None
+
+    def test_a_tick_with_no_usable_price_is_ignored(self) -> None:
+        """A quote with nothing to compare cannot diverge from anything, and
+        must not evict the good price already cached for that side."""
+        _, dual = self._monitors()
+        dual.observe_primary(tick(last=Decimal("187.50")))
+        assert dual.observe_primary(tick(bid=None, ask=None, last=None)) is None
+        assert dual.observe_backup(tick(bid=Decimal("200.00"), ask=Decimal("200.02"))) is not None
+
+    def test_divergences_are_recorded_for_the_post_mortem(self) -> None:
+        _, dual = self._monitors()
+        dual.observe_primary(tick())
+        dual.observe_backup(tick(bid=Decimal("200.00"), ask=Decimal("200.02")))
+        assert len(dual.divergences) == 1
+
+    def test_the_divergence_log_is_a_copy(self) -> None:
+        _, dual = self._monitors()
+        dual.observe_primary(tick())
+        dual.observe_backup(tick(bid=Decimal("200.00"), ask=Decimal("200.02")))
+        dual.divergences.clear()
+        assert len(dual.divergences) == 1
+
+    def test_clearing_a_symbol_drops_both_sides(self) -> None:
+        """Used when a source reconnects: the cached price predates the gap,
+        so comparing against it would measure the outage, not a disagreement."""
+        _, dual = self._monitors()
+        dual.observe_primary(tick(last=Decimal("187.50")))
+        dual.clear("AAPL")
+        assert dual.observe_backup(tick(bid=Decimal("200.00"), ask=Decimal("200.02"))) is None
+
+    def test_clearing_an_unknown_symbol_is_harmless(self) -> None:
+        _, dual = self._monitors()
+        dual.clear("NEVER_SEEN")
+
+
+class _StubFeed:
+    """Minimal MarketDataFeed for the failover decision, which only reads
+    ``status`` — connecting a real feed would test the feed, not the choice."""
+
+    def __init__(self, name: str, status: str = FeedStatus.CONNECTED) -> None:
+        self._name = name
+        self.status = status
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+
+class TestChooseActiveFeed:
+    """Spec §5.3 failover. Distinct from divergence: a primary that has
+    *stopped* is unambiguous, so the backup is simply used. A primary that is
+    producing *wrong* data is the divergence case, where switching would just
+    be guessing — which is why nothing here inspects prices.
+    """
+
+    def _clock(self, at_ns: int = BASE_NS) -> SimulatedClock:
+        return SimulatedClock(start_ns=at_ns)
+
+    def test_with_no_backup_the_primary_is_used_however_bad_it_looks(self) -> None:
+        primary = _StubFeed("primary", FeedStatus.DISCONNECTED)
+        chosen, reason = choose_active_feed(
+            primary, None, clock=self._clock(), last_primary_tick_ns=None
+        )
+        assert chosen is primary
+        assert reason == "no backup configured"
+
+    @pytest.mark.parametrize("status", [FeedStatus.DISCONNECTED, FeedStatus.EXHAUSTED])
+    def test_a_dead_primary_fails_over(self, status: str) -> None:
+        primary, backup = _StubFeed("primary", status), _StubFeed("backup")
+        chosen, reason = choose_active_feed(
+            primary, backup, clock=self._clock(), last_primary_tick_ns=BASE_NS
+        )
+        assert chosen is backup
+        assert status in reason
+
+    def test_a_degraded_primary_is_kept(self) -> None:
+        """DEGRADED means connected but disagreeing — the divergence path
+        already blocked new orders, and swapping feeds would be picking a
+        side. Only a feed producing *nothing* justifies failover."""
+        primary, backup = _StubFeed("primary", FeedStatus.DEGRADED), _StubFeed("backup")
+        chosen, _ = choose_active_feed(
+            primary, backup, clock=self._clock(), last_primary_tick_ns=BASE_NS
+        )
+        assert chosen is primary
+
+    def test_a_primary_that_has_not_started_yet_is_given_the_benefit(self) -> None:
+        """At boot there is no last tick. Treating that as silence would fail
+        over to the backup on every startup."""
+        primary, backup = _StubFeed("primary"), _StubFeed("backup")
+        chosen, reason = choose_active_feed(
+            primary, backup, clock=self._clock(), last_primary_tick_ns=None
+        )
+        assert chosen is primary
+        assert reason == "primary has not produced yet"
+
+    def test_a_recently_active_primary_is_healthy(self) -> None:
+        primary, backup = _StubFeed("primary"), _StubFeed("backup")
+        chosen, reason = choose_active_feed(
+            primary,
+            backup,
+            clock=self._clock(BASE_NS + 3 * NS_PER_SECOND),
+            last_primary_tick_ns=BASE_NS,
+            stale_after_seconds=10,
+        )
+        assert chosen is primary
+        assert reason == "primary healthy"
+
+    def test_a_silent_primary_fails_over_and_says_how_long(self) -> None:
+        primary, backup = _StubFeed("primary"), _StubFeed("backup")
+        chosen, reason = choose_active_feed(
+            primary,
+            backup,
+            clock=self._clock(BASE_NS + 30 * NS_PER_SECOND),
+            last_primary_tick_ns=BASE_NS,
+            stale_after_seconds=10,
+        )
+        assert chosen is backup
+        assert "30.0s" in reason
+
+    def test_the_threshold_is_exclusive(self) -> None:
+        """Exactly at the limit is not yet stale — a feed on a 10s heartbeat
+        with a 10s threshold would otherwise flap every single beat."""
+        primary, backup = _StubFeed("primary"), _StubFeed("backup")
+        chosen, _ = choose_active_feed(
+            primary,
+            backup,
+            clock=self._clock(BASE_NS + 10 * NS_PER_SECOND),
+            last_primary_tick_ns=BASE_NS,
+            stale_after_seconds=10,
+        )
+        assert chosen is primary
