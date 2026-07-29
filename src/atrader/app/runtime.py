@@ -231,6 +231,13 @@ class Runtime:
         self._pending_approvals: dict[UUID, TradingIntent] = {}
         self._last_date: date | None = None
         self._last_equity: Decimal = config.account_equity
+        #: One closing mark per calendar day, for the backtest-vs-live
+        #: comparison acceptance criterion #7 needs (see
+        #: :mod:`atrader.backtest.divergence`). Daily rather than per-bar so a
+        #: month-long session stays bounded at ~30 entries whatever the bar
+        #: interval — and because daily is the granularity the criterion and
+        #: ``performance_report``'s 252-periods-per-year default both assume.
+        self._daily_equity: list[tuple[int, Decimal]] = []
         self._running = False
         self._started_at_ns: int | None = None
         self._ticks_processed = 0
@@ -409,6 +416,17 @@ class Runtime:
             "unrealized": sum((p.unrealized_pnl for p in positions), ZERO),
             "equity": self._last_equity,
         }
+
+    def daily_equity_curve(self) -> tuple[tuple[int, Decimal], ...]:
+        """Closing equity per calendar day, oldest first.
+
+        Same ``(at_ns, equity)`` shape as
+        :attr:`~atrader.backtest.engine.BacktestResult.equity_curve`, so a live
+        session and a backtest can be handed straight to
+        :func:`~atrader.backtest.divergence.divergence_report` without either
+        side being converted first.
+        """
+        return tuple(self._daily_equity)
 
     # ------------------------------------------------------------------
     # Tick / bar processing
@@ -696,8 +714,12 @@ class Runtime:
         if self._last_date is None or today != self._last_date:
             self._last_date = today
             self._risk_state.start_new_day(equity)
+            self._daily_equity.append((at_ns, equity))
         else:
             self._risk_state.observe_equity(equity)
+            # Overwrite rather than append: the day's entry should be its
+            # latest mark, so when the day ends the curve holds its close.
+            self._daily_equity[-1] = (at_ns, equity)
 
     async def _cancel_all_for_deadman(self) -> list[object]:
         canceled = await self.oms.cancel_all()

@@ -1,18 +1,24 @@
-"""Every file the system needs to boot must actually be in the repository.
+"""No source file may be invisible to git.
 
 This exists because it already went wrong once. ``.gitignore`` carried a
 ``secrets.*`` rule meant to keep credential files out of version control, and
 it silently swallowed ``src/atrader/config/secrets.py`` — the
 :class:`~atrader.config.secrets.SecretProvider` module. Every local check
-passed (the file was on disk), the push succeeded, and the repository was
-broken: a fresh clone could not import ``atrader.config.secrets`` at all.
+passed (the file was on disk), ``git status`` was clean, ``git add .`` did
+nothing, the push succeeded, and the repository was broken: a fresh clone
+could not import ``atrader.config.secrets`` at all.
 
-A working tree is not the deliverable — the commit is. So this test compares
-what is on disk against what ``git ls-files`` actually tracks, and fails on
-anything the repository would be missing after a clean clone. It is cheap
-insurance against a whole class of "works on my machine" that no amount of
-test coverage can catch, because the tests themselves run against the
-untracked file.
+What made that bug survive was not that the file was uncommitted — it was
+that the file was **ignored**, and therefore invisible. An ordinary uncommitted
+file announces itself in ``git status`` on every command; an ignored one never
+does, and no amount of test coverage helps because the tests run against the
+copy on disk.
+
+So this checks ignored-ness, not tracked-ness. Asserting that every source
+file is already committed would fail every time anyone adds a new module
+before staging it — a guard that cries wolf on normal work gets deleted, and
+then it is not guarding anything. Narrowing it to the silent case gives it no
+false positives and keeps it pointed at the failure it exists to prevent.
 """
 
 from __future__ import annotations
@@ -24,52 +30,63 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: directory -> glob of files that must be committed for the system to run.
+#: directory -> glob of files that must reach a fresh clone for the system to run.
 REQUIRED: dict[str, str] = {
     "src": "**/*.py",  # the package itself
     "config": "**/*.yaml",  # spec §4.6 — boot fails closed without these
+    "tests": "**/*.py",  # a test that never ships is a test that never runs
 }
 
 
-def tracked_files() -> frozenset[Path]:
+def ignored_paths(candidates: list[Path]) -> list[Path]:
+    """Which of *candidates* git would refuse to track, via ``check-ignore``.
+
+    ``--stdin`` in one call rather than one subprocess per file: the package
+    has a hundred-odd modules and this test should not cost a hundred process
+    spawns. Exit code 1 means "nothing matched", which is the healthy case,
+    so it is not an error here.
+    """
+    if not candidates:
+        return []
     result = subprocess.run(
-        ["git", "ls-files", "-z"],
+        ["git", "check-ignore", "--stdin"],
         cwd=REPO_ROOT,
+        input="\n".join(str(p) for p in candidates),
         capture_output=True,
         text=True,
-        check=True,
         timeout=60,
     )
-    return frozenset(Path(line) for line in result.stdout.split("\0") if line)
+    if result.returncode not in (0, 1):
+        raise AssertionError(f"git check-ignore failed: {result.stderr}")
+    return [Path(line) for line in result.stdout.splitlines() if line]
 
 
-@pytest.fixture(scope="module")
-def tracked() -> frozenset[Path]:
+@pytest.fixture(scope="module", autouse=True)
+def _require_git_checkout() -> None:
     if not (REPO_ROOT / ".git").exists():
-        pytest.skip("not a git checkout — nothing to compare against")
-    return tracked_files()
+        pytest.skip("not a git checkout — there is no .gitignore to be caught by")
 
 
 @pytest.mark.parametrize(("directory", "pattern"), sorted(REQUIRED.items()))
-def test_no_required_file_is_missing_from_git(
-    directory: str, pattern: str, tracked: frozenset[Path]
-) -> None:
+def test_no_required_file_is_hidden_from_git_by_gitignore(directory: str, pattern: str) -> None:
     root = REPO_ROOT / directory
     if not root.is_dir():
         pytest.skip(f"{directory}/ does not exist in this checkout")
 
-    on_disk = {
+    on_disk = [
         path.relative_to(REPO_ROOT)
         for path in root.glob(pattern)
         if path.is_file() and "__pycache__" not in path.parts
-    }
-    missing = sorted(str(path) for path in on_disk - tracked)
+    ]
+    assert on_disk, f"{directory}/{pattern} matched nothing — the guard would prove nothing"
 
-    assert not missing, (
-        f"{len(missing)} file(s) under {directory}/ exist on disk but are not "
-        f"tracked by git, so a fresh clone would not have them:\n  "
-        + "\n  ".join(missing)
-        + "\n\nCheck .gitignore — a broad rule (this happened with 'secrets.*') "
-        "will exclude source files without any visible error. Add a negation "
-        "for the affected path rather than dropping the protective rule."
+    hidden = sorted(str(path) for path in ignored_paths(on_disk))
+
+    assert not hidden, (
+        f"{len(hidden)} file(s) under {directory}/ are excluded by .gitignore, so "
+        f"they will never reach a fresh clone and git will never say so:\n  "
+        + "\n  ".join(hidden)
+        + "\n\nThis happened once with the 'secrets.*' rule swallowing "
+        "src/atrader/config/secrets.py. Add a negation for the affected path "
+        "(e.g. '!**/secrets.py') rather than dropping the protective rule."
     )

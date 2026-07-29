@@ -46,8 +46,14 @@ uv run pytest tests/unit/test_prompt_injection.py       # 인수기준 #10
 
 인수기준 #7(30일 페이퍼 트레이딩 괴리 <30%)과 #8(RTO 5분)은 시간·인프라가 필요해
 자동화된 테스트로 검증할 수 없다 — 계획 단계에서부터 이번 세션 범위 밖으로 확정했다.
-`atrader reconcile`(§4)과 `Reconciler`가 #8이 요구하는 절차(재기동 시 상태 대조)의
-실제 구현체이므로, 실행 자체는 운영 단계에서 시간을 들여 수행해야 한다.
+**측정 도구는 구현돼 있고, 실행만 남았다**:
+
+- #7 → `atrader divergence-report` (아래 6절). `atrader.backtest.divergence`가
+  계산 주체이며 `tests/unit/test_divergence.py`가 100% 커버한다.
+- #8 → `atrader reconcile`(§4)과 `Reconciler`가 재기동 시 상태 대조 절차의 구현체다.
+
+두 경우 모두 **도구가 있다는 것과 기준을 충족했다는 것은 다르다**. 실제 30일 실행과
+실제 복구 훈련은 운영 단계의 몫이다.
 
 ## 2. 페이퍼 트레이딩 실행
 
@@ -161,6 +167,44 @@ uv run atrader replay --config config --strategy sma_crossover \
 재현 가능하게 돌리려면 `RecordedLLMClient`에 미리 녹화된 응답이 필요한데, 이걸 CLI
 옵션으로 노출하는 건 이번 범위 밖이다. 필요하면 `atrader.backtest.engine.BacktestEngine`을
 직접 스크립트에서 조립해 `RecordedLLMClient`를 넘겨라.
+
+## 7-1. 백테스트 대비 실거래 괴리 측정 (인수기준 #7)
+
+인수기준 #7은 "30일 페이퍼 트레이딩 결과가 백테스트 대비 괴리 30% 미만"이다. 30일이
+실제로 흘러야 하므로 여기서 충족시킬 수는 없지만, **판정하는 도구는 구현돼 있다**.
+운영에서 30일을 돌린 뒤 아래 세 단계로 답이 나온다.
+
+```bash
+# 1. 백테스트 자산곡선 기록
+uv run atrader backtest --config config --strategy sma_crossover \
+  --from 2024-01-01 --to 2024-01-31 --equity-out runs/backtest-equity.jsonl
+
+# 2. 페이퍼 트레이딩 자산곡선 기록 (30일 실행)
+uv run atrader run --config config --equity-out runs/live-equity.jsonl
+
+# 3. 괴리 판정 — 초과 시 exit code 1 (승격 게이트로 쓸 수 있다)
+uv run atrader divergence-report \
+  --backtest runs/backtest-equity.jsonl --live runs/live-equity.jsonl [--tolerance 30]
+```
+
+`--equity-out`은 **일별 종가 자산 1점**만 기록한다. 바 단위로 기록하면 1초 바 기준
+30일이 수백만 포인트가 되고, 애초에 인수기준도 `performance_report`의 기본값(연 252
+기간)도 전부 "일" 단위로 진술돼 있다. 이 옵션은 `finally` 블록에서 쓰이므로 Ctrl-C나
+킬 스위치로 끝난 세션도 곡선을 남긴다.
+
+읽을 때 주의할 것 세 가지 (`atrader.backtest.divergence` 모듈 docstring에 근거와 함께
+정리돼 있다):
+
+| 상황 | 리포트의 처리 |
+|---|---|
+| 백테스트 값이 0, 실거래 값은 0이 아님 | **비교 불가**(`relative_pct=None`). 0으로 나눈 값은 "무한대"가 아니라 "수치 아님"이다. 통과로도 실패로도 세지 않으며, 게이트 대상이면 `within_tolerance`가 False가 된다 |
+| 백테스트 값도 0, 실거래 값도 0 | 괴리 정확히 0 — 두 값이 완전히 일치하는 것을 "비교 불가"로 처리하면 맞는 실행을 형식논리로 떨어뜨리게 된다 |
+| 두 실행의 기간 길이가 2배 넘게 차이 | `periods_aligned=False`. 1년 백테스트와 30일 실거래의 총수익률 비교는 전략 충실도와 무관한 이유로 다르므로, 판정 자체를 거부한다 |
+
+게이트 대상은 기본적으로 `total_return_pct`·`sharpe_ratio`·`max_drawdown_pct` 셋뿐이다
+(각각 "결과를 예측했나 / 과정을 예측했나 / 최악의 순간을 예측했나"). 체결 횟수와
+변동성은 **원인 분석용으로 출력만 되고 판정에는 쓰이지 않는다** — 10번 대신 8번
+거래해서 같은 결과를 냈다면 그건 기준 미달이 아니다.
 
 ## 8. LLM 에이전트 전략
 

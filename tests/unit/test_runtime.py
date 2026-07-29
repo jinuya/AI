@@ -386,3 +386,60 @@ class TestDeadmanIntegration:
         assert runtime.storage.orders.open_orders() == []
         assert b"atrader_deadman_triggers_total 1.0" in runtime.metrics.render()
         assert report.canceled_order_ids
+
+
+class TestDailyEquityCurve:
+    """The live half of a divergence report (acceptance criterion #7).
+
+    What matters is that the curve stays *daily* — one closing mark per
+    calendar day regardless of bar interval — because a per-bar curve on a
+    month-long run at second bars would be millions of points, and because
+    the criterion and ``performance_report``'s 252-periods-per-year default
+    are both stated in days.
+    """
+
+    async def test_many_bars_in_one_day_produce_one_point(self) -> None:
+        runtime = make_runtime([_BuyOnceStrategy("buyer", "AAPL")], buy_signal_ticks())
+        await runtime.run_forever()
+
+        curve = runtime.daily_equity_curve()
+        assert runtime.status().bars_processed > 1, "fixture must span several bars"
+        assert len(curve) == 1, f"all ticks are the same UTC day, got {len(curve)} points"
+
+    async def test_the_single_point_holds_the_days_latest_equity(self) -> None:
+        runtime = make_runtime([_BuyOnceStrategy("buyer", "AAPL")], buy_signal_ticks())
+        await runtime.run_forever()
+
+        ((_, equity),) = runtime.daily_equity_curve()
+        assert equity == runtime.status().equity
+
+    async def test_a_run_that_processed_no_bars_has_an_empty_curve(self) -> None:
+        runtime = make_runtime([_BuyOnceStrategy("buyer", "AAPL")], [])
+        await runtime.run_forever()
+        assert runtime.daily_equity_curve() == ()
+
+    async def test_a_second_day_appends_rather_than_overwriting(self) -> None:
+        one_day_seconds = 86_400
+        ticks = [
+            make_tick(offset_seconds=0, price="100", seq=1),
+            make_tick(offset_seconds=1, price="100", seq=2),
+            make_tick(offset_seconds=one_day_seconds, price="101", seq=3),
+            make_tick(offset_seconds=one_day_seconds + 1, price="101", seq=4),
+        ]
+        runtime = make_runtime([_BuyOnceStrategy("buyer", "AAPL")], ticks)
+        await runtime.run_forever()
+
+        curve = runtime.daily_equity_curve()
+        assert len(curve) == 2
+        assert curve[0][0] < curve[1][0], "points must be in chronological order"
+
+    async def test_the_curve_feeds_a_divergence_report_without_conversion(self) -> None:
+        """The whole point of the shared ``(at_ns, equity)`` shape: a live
+        session's curve is directly comparable to a backtest's."""
+        from atrader.backtest.divergence import divergence_report
+
+        runtime = make_runtime([_BuyOnceStrategy("buyer", "AAPL")], buy_signal_ticks())
+        await runtime.run_forever()
+
+        report = divergence_report(runtime.daily_equity_curve(), runtime.daily_equity_curve())
+        assert report.live.num_periods == len(runtime.daily_equity_curve())

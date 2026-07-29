@@ -35,6 +35,12 @@ from atrader.audit.hashchain import (
     records_from_json_bytes,
     verify_chain,
 )
+from atrader.backtest.divergence import (
+    DEFAULT_TOLERANCE_PCT,
+    divergence_report,
+    dump_equity_curve,
+    load_equity_curve,
+)
 from atrader.backtest.engine import BacktestEngine
 from atrader.backtest.metrics import performance_report
 from atrader.backtest.replay import assert_replay_matches
@@ -182,14 +188,18 @@ def run(
         float | None,
         typer.Option("--duration", help="Bound the run in seconds. Omit to run until killed."),
     ] = None,
+    equity_out: Annotated[Path | None, typer.Option("--equity-out")] = None,
 ) -> None:
     """Start the trading runtime and its HTTP control surface.
 
     This system's only broker is the paper simulator (a confirmed scope
     decision — see docs/runbook.md), so ``run`` and ``paper`` do the same
     thing; ``paper`` just defaults to a bounded smoke-test duration.
+
+    ``--equity-out`` records one closing equity mark per day, which is the
+    live half of a ``divergence-report`` (acceptance criterion #7).
     """
-    asyncio.run(_serve(config_dir, host, port, duration))
+    asyncio.run(_serve(config_dir, host, port, duration, equity_out))
 
 
 @app.command()
@@ -198,12 +208,19 @@ def paper(
     host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port")] = 8000,
     duration: Annotated[float, typer.Option("--duration")] = 60.0,
+    equity_out: Annotated[Path | None, typer.Option("--equity-out")] = None,
 ) -> None:
     """Alias for ``run``, bounded by default (e.g. ``--duration 60s`` style smoke tests)."""
-    asyncio.run(_serve(config_dir, host, port, duration))
+    asyncio.run(_serve(config_dir, host, port, duration, equity_out))
 
 
-async def _serve(config_dir: Path, host: str, port: int, duration: float | None) -> None:
+async def _serve(
+    config_dir: Path,
+    host: str,
+    port: int,
+    duration: float | None,
+    equity_out: Path | None = None,
+) -> None:
     import uvicorn
 
     from atrader.app.api import create_app
@@ -237,6 +254,14 @@ async def _serve(config_dir: Path, host: str, port: int, duration: float | None)
     finally:
         server.should_exit = True
         await server_task
+        # In the `finally` so a session ended by Ctrl-C or the kill switch
+        # still leaves its curve behind — a month-long paper run that loses
+        # its equity history because it was stopped the usual way would make
+        # this option useless for the thing it exists to measure.
+        if equity_out is not None:
+            curve = runtime.daily_equity_curve()
+            dump_equity_curve(curve, equity_out)
+            logger.info("equity curve written", path=str(equity_out), points=len(curve))
 
 
 # ---------------------------------------------------------------------------
@@ -336,13 +361,23 @@ def backtest(
     bars_file: Annotated[Path | None, typer.Option("--bars")] = None,
     from_date: Annotated[str, typer.Option("--from")] = "2024-01-01",
     to_date: Annotated[str, typer.Option("--to")] = "2024-12-31",
+    equity_out: Annotated[Path | None, typer.Option("--equity-out")] = None,
 ) -> None:
-    """Run a strategy over historical (or, absent ``--bars``, synthetic) bars."""
-    asyncio.run(_run_backtest(config_dir, strategy_id, bars_file, from_date, to_date))
+    """Run a strategy over historical (or, absent ``--bars``, synthetic) bars.
+
+    ``--equity-out`` records the equity curve for a later
+    ``divergence-report`` against a live session (acceptance criterion #7).
+    """
+    asyncio.run(_run_backtest(config_dir, strategy_id, bars_file, from_date, to_date, equity_out))
 
 
 async def _run_backtest(
-    config_dir: Path, strategy_id: str, bars_file: Path | None, from_date: str, to_date: str
+    config_dir: Path,
+    strategy_id: str,
+    bars_file: Path | None,
+    from_date: str,
+    to_date: str,
+    equity_out: Path | None = None,
 ) -> None:
     config = _load_config(config_dir)
     try:
@@ -361,6 +396,10 @@ async def _run_backtest(
     typer.echo(f"rejected intents: {len(result.rejected_intents)}")
     for field_name, value in asdict(report).items():
         typer.echo(f"{field_name}: {value}")
+
+    if equity_out is not None:
+        dump_equity_curve(result.equity_curve, equity_out)
+        typer.echo(f"equity curve written to {equity_out}")
 
 
 @app.command()
@@ -470,6 +509,42 @@ def verify_audit(
     if not result.valid:
         typer.echo(f"first bad seq: {result.first_bad_seq}; {result.reason}", err=True)
     raise typer.Exit(code=0 if result.valid else 1)
+
+
+# ---------------------------------------------------------------------------
+# divergence-report
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="divergence-report")
+def divergence_report_command(
+    backtest_curve: Annotated[
+        Path, typer.Option("--backtest", help="Equity curve from `backtest --equity-out`.")
+    ],
+    live_curve: Annotated[
+        Path, typer.Option("--live", help="Equity curve from `run/paper --equity-out`.")
+    ],
+    tolerance_pct: Annotated[float, typer.Option("--tolerance")] = float(DEFAULT_TOLERANCE_PCT),
+) -> None:
+    """Measure how far a live session drifted from its backtest.
+
+    This is the instrument for acceptance criterion #7 (30일 페이퍼 트레이딩
+    괴리 30% 미만), not the criterion itself: producing the verdict needs a
+    real thirty-day paper run to point it at. Exits non-zero when the runs
+    diverged past ``--tolerance``, so it can gate a promotion step.
+    """
+    try:
+        backtest_points = load_equity_curve(backtest_curve)
+        live_points = load_equity_curve(live_curve)
+    except (OSError, ATraderError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+    report = divergence_report(
+        backtest_points, live_points, tolerance_pct=Decimal(str(tolerance_pct))
+    )
+    typer.echo(report.summary())
+    raise typer.Exit(code=0 if report.within_tolerance else 1)
 
 
 def main() -> None:

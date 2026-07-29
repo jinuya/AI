@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import replace
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from typer.testing import CliRunner
 
 from atrader.app import cli as cli_module
 from atrader.audit.hashchain import GENESIS_HASH, AuditRecord, compute_hash, dump_records_jsonl
+from atrader.backtest.divergence import dump_equity_curve, load_equity_curve
 from atrader.config.schema import StrategyConfig
 from atrader.core.errors import ATraderError
 from atrader.strategy.rules.sma_crossover import SmaCrossoverStrategy
@@ -329,5 +331,112 @@ class TestKillAndReconcileCommands:
     def test_kill_against_an_unreachable_url_is_a_clean_error(self) -> None:
         result = runner.invoke(
             cli_module.app, ["kill", "--reason", "x", "--api-url", "http://127.0.0.1:1"]
+        )
+        assert result.exit_code == 1
+
+
+class TestDivergenceReportCommand:
+    """Acceptance criterion #7's instrument, wired end to end: a backtest
+    writes its curve, and the report reads two of them back and returns an
+    exit code a promotion step can gate on."""
+
+    def _write_curve(self, path: Path, equities: list[str]) -> Path:
+        dump_equity_curve(
+            [(i * 86_400 * 1_000_000_000, Decimal(e)) for i, e in enumerate(equities)], path
+        )
+        return path
+
+    def test_backtest_can_write_the_curve_the_report_reads(self, tmp_path: Path) -> None:
+        config_dir = write_config(tmp_path)
+        curve_path = tmp_path / "backtest-equity.jsonl"
+        result = runner.invoke(
+            cli_module.app,
+            [
+                "backtest",
+                "--config",
+                str(config_dir),
+                "--from",
+                "2024-01-01",
+                "--to",
+                "2024-02-01",
+                "--equity-out",
+                str(curve_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert curve_path.is_file()
+        assert len(load_equity_curve(curve_path)) > 1
+
+    def test_matching_curves_exit_zero(self, tmp_path: Path) -> None:
+        equities = [str(100000 + 100 * i) for i in range(30)]
+        backtest = self._write_curve(tmp_path / "bt.jsonl", equities)
+        live = self._write_curve(tmp_path / "live.jsonl", equities)
+        result = runner.invoke(
+            cli_module.app,
+            ["divergence-report", "--backtest", str(backtest), "--live", str(live)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "WITHIN TOLERANCE" in result.output
+
+    def test_a_run_that_earned_half_as_much_exits_nonzero(self, tmp_path: Path) -> None:
+        backtest = self._write_curve(
+            tmp_path / "bt.jsonl", [str(100000 + 100 * i) for i in range(30)]
+        )
+        live = self._write_curve(tmp_path / "live.jsonl", [str(100000 + 50 * i) for i in range(30)])
+        result = runner.invoke(
+            cli_module.app,
+            ["divergence-report", "--backtest", str(backtest), "--live", str(live)],
+        )
+        assert result.exit_code == 1
+        assert "OUT OF TOLERANCE" in result.output
+
+    def test_raising_the_tolerance_changes_the_verdict(self, tmp_path: Path) -> None:
+        backtest = self._write_curve(
+            tmp_path / "bt.jsonl", [str(100000 + 100 * i) for i in range(30)]
+        )
+        live = self._write_curve(tmp_path / "live.jsonl", [str(100000 + 90 * i) for i in range(30)])
+        strict = runner.invoke(
+            cli_module.app,
+            [
+                "divergence-report",
+                "--backtest",
+                str(backtest),
+                "--live",
+                str(live),
+                "--tolerance",
+                "5",
+            ],
+        )
+        lenient = runner.invoke(
+            cli_module.app,
+            [
+                "divergence-report",
+                "--backtest",
+                str(backtest),
+                "--live",
+                str(live),
+                "--tolerance",
+                "30",
+            ],
+        )
+        assert strict.exit_code == 1
+        assert lenient.exit_code == 0, lenient.output
+
+    def test_a_missing_curve_file_is_a_clean_error_not_a_traceback(self, tmp_path: Path) -> None:
+        live = self._write_curve(tmp_path / "live.jsonl", ["100000", "100100"])
+        result = runner.invoke(
+            cli_module.app,
+            ["divergence-report", "--backtest", str(tmp_path / "nope.jsonl"), "--live", str(live)],
+        )
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+
+    def test_a_corrupt_curve_file_is_a_clean_error(self, tmp_path: Path) -> None:
+        bad = tmp_path / "bad.jsonl"
+        bad.write_text("this is not json\n", encoding="utf-8")
+        live = self._write_curve(tmp_path / "live.jsonl", ["100000", "100100"])
+        result = runner.invoke(
+            cli_module.app,
+            ["divergence-report", "--backtest", str(bad), "--live", str(live)],
         )
         assert result.exit_code == 1
