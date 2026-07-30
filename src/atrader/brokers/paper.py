@@ -72,7 +72,22 @@ class RestingOrder:
     avg_fill_price: Decimal | None = None
     volume_seen: Decimal = ZERO
     """Volume traded at or through our price since we joined the queue."""
+    volume_consumed: Decimal = ZERO
+    """How much of ``volume_seen`` this order has already taken.
+
+    Tracked separately from ``filled_quantity`` because amending an order
+    resets the queue (and therefore ``volume_seen``) while its fills stay on
+    the books — subtracting ``filled_quantity`` from a restarted queue would
+    stall the order permanently.
+    """
     accepted_at_ns: int = 0
+    stop_triggered: bool = False
+    """STOP/STOP_LIMIT only: whether the market has reached the stop price.
+
+    Until it has, the order is not in the book at all — a stop that fills
+    before it triggers is not a stop, and every protective exit in the
+    simulation would execute the moment it was placed.
+    """
 
     @property
     def remaining(self) -> Decimal:
@@ -143,9 +158,13 @@ class PaperBroker:
             order_types=frozenset(
                 {OrderType.MARKET, OrderType.LIMIT, OrderType.STOP, OrderType.STOP_LIMIT}
             ),
-            time_in_force=frozenset(
-                {TimeInForce.DAY, TimeInForce.GTC, TimeInForce.IOC, TimeInForce.FOK}
-            ),
+            # IOC and FOK are deliberately absent: this simulator fills across
+            # successive prints, so "immediately" has no meaning here, and
+            # advertising them meant an IOC rested like a GTC and an FOK
+            # partially filled — the two things those instructions forbid.
+            # Being refused by `rejects()` is the honest outcome; silently
+            # behaving as GTC is not.
+            time_in_force=frozenset({TimeInForce.DAY, TimeInForce.GTC}),
             supports_short_selling=self._config.allow_short,
             supports_modify=True,
             supports_stop_at_broker=True,
@@ -205,6 +224,17 @@ class PaperBroker:
                     f"{request.symbol} to sell"
                 )
 
+        # Resolve the market price *before* registering anything. Doing it
+        # after (where the fill happens) means a missing price raises
+        # PermanentBrokerError with the order already accepted and working —
+        # the caller records a permanent failure while the broker holds a live
+        # order, which is exactly the divergence this module promises never to
+        # manufacture ("a synchronous rejection never creates an order the
+        # system believes is working").
+        market_price = (
+            self._market_price(request.symbol) if request.order_type is OrderType.MARKET else None
+        )
+
         resting = RestingOrder(
             request=request,
             broker_order_id=self._next_order_id(),
@@ -219,8 +249,8 @@ class PaperBroker:
             status=OrderStatus.NEW,
         )
 
-        if request.order_type is OrderType.MARKET:
-            self._fill(resting, resting.remaining, self._market_price(request.symbol))
+        if market_price is not None:
+            self._fill(resting, resting.remaining, market_price)
 
         return OrderAck(
             client_order_id=request.client_order_id,
@@ -275,6 +305,7 @@ class PaperBroker:
             resting.request = resting.request.model_copy(update=updates)
             # Amending loses queue priority at every venue that allows it.
             resting.volume_seen = ZERO
+            resting.volume_consumed = ZERO
 
         return OrderAck(
             client_order_id=client_order_id,
@@ -344,7 +375,12 @@ class PaperBroker:
             if resting.volume_seen < queue_ahead:
                 continue  # still behind other orders at this level
 
-            available = resting.volume_seen - queue_ahead
+            # Subtract what this order has already taken: `volume_seen` is
+            # cumulative tape, so without it the same shares fill the order
+            # again on every subsequent print — 35 shares of tape filling 65
+            # shares of order, in the optimistic direction the module
+            # docstring warns flatters a backtest.
+            available = resting.volume_seen - queue_ahead - resting.volume_consumed
             fill_quantity = min(resting.remaining, available)
             if self._rng.uniform(0, 1) < self._config.partial_fill_probability:
                 fill_quantity = quantize(
@@ -355,6 +391,7 @@ class PaperBroker:
                 continue
 
             fill_price = resting.request.limit_price or price
+            resting.volume_consumed += fill_quantity
             events.extend(self._fill(resting, fill_quantity, fill_price))
 
         return events
@@ -382,6 +419,8 @@ class PaperBroker:
     # ------------------------------------------------------------------
 
     def _is_marketable(self, resting: RestingOrder, price: Decimal) -> bool:
+        if not self._stop_is_live(resting, price):
+            return False
         limit = resting.request.limit_price
         if limit is None:
             return True
@@ -390,6 +429,23 @@ class PaperBroker:
         if resting.request.side is Side.BUY:
             return price < limit
         return price > limit
+
+    def _stop_is_live(self, resting: RestingOrder, price: Decimal) -> bool:
+        """Whether a stop order has been triggered (and so may fill at all).
+
+        A BUY stop arms when the market rises to it, a SELL stop when the
+        market falls to it — the protective directions. Triggering latches:
+        a stop that armed and then saw the price retreat stays armed, which
+        is how venues behave and what a stop-loss depends on.
+        """
+        stop = resting.request.stop_price
+        if stop is None:
+            return True
+        if resting.stop_triggered:
+            return True
+        triggered = price >= stop if resting.request.side is Side.BUY else price <= stop
+        resting.stop_triggered = triggered
+        return triggered
 
     def _fill(self, resting: RestingOrder, quantity: Decimal, price: Decimal) -> list[BrokerEvent]:
         quantity = min(quantity, resting.remaining)

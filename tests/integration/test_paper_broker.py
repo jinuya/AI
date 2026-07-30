@@ -23,6 +23,7 @@ from atrader.brokers.protocol import BrokerCapabilities
 from atrader.core.clock import SimulatedClock
 from atrader.core.errors import PermanentBrokerError, UnsupportedByBrokerError
 from atrader.core.models import OrderRequest
+from atrader.core.money import ZERO
 from atrader.core.rng import SeededRng
 from atrader.core.types import OrderStatus, OrderType, Side, TimeInForce
 
@@ -588,3 +589,153 @@ class TestCapabilitiesRejection:
             limit_price=Decimal("10"),
         )
         assert caps.rejects(request) is None
+
+
+class TestStopOrdersMustTriggerBeforeTheyFill:
+    """`stop_price` was never read: `_is_marketable` looked only at
+    `limit_price`, so a STOP with no limit was marketable from the instant it
+    was accepted. Every protective stop in a paper session executed
+    immediately, at whatever the market happened to be — the opposite of what
+    a stop is for, and silently, because the order looked normally filled.
+    """
+
+    @pytest.fixture
+    def broker(self, clock: SimulatedClock) -> PaperBroker:
+        return PaperBroker(
+            clock,
+            config=PaperBrokerConfig(
+                latency_ns=0, partial_fill_probability=0.0, queue_ahead_multiple=Decimal(0)
+            ),
+            prices={"AAPL": Decimal("100")},
+        )
+
+    async def test_a_sell_stop_below_the_market_does_not_fill(self, broker: PaperBroker) -> None:
+        await broker.submit_order(
+            make_request(
+                side=Side.SELL,
+                order_type=OrderType.STOP,
+                limit_price=None,
+                stop_price=Decimal("90"),
+                quantity=Decimal("10"),
+            )
+        )
+        broker.advance_market("AAPL", Decimal("100"), Decimal("1000"))
+
+        state = await broker.get_order("coid-1")
+        assert state is not None
+        assert state.filled_quantity == ZERO
+
+    async def test_it_fills_once_the_market_falls_to_the_stop(self, broker: PaperBroker) -> None:
+        await broker.submit_order(
+            make_request(
+                side=Side.SELL,
+                order_type=OrderType.STOP,
+                limit_price=None,
+                stop_price=Decimal("90"),
+                quantity=Decimal("10"),
+            )
+        )
+        broker.advance_market("AAPL", Decimal("100"), Decimal("1000"))
+        broker.advance_market("AAPL", Decimal("89"), Decimal("1000"))
+
+        state = await broker.get_order("coid-1")
+        assert state is not None
+        assert state.filled_quantity == Decimal("10")
+
+    async def test_a_buy_stop_above_the_market_waits_for_the_rise(
+        self, broker: PaperBroker
+    ) -> None:
+        await broker.submit_order(
+            make_request(
+                order_type=OrderType.STOP,
+                limit_price=None,
+                stop_price=Decimal("150"),
+                quantity=Decimal("10"),
+            )
+        )
+        broker.advance_market("AAPL", Decimal("100"), Decimal("1000"))
+        unfilled = await broker.get_order("coid-1")
+        assert unfilled is not None and unfilled.filled_quantity == ZERO
+
+        broker.advance_market("AAPL", Decimal("151"), Decimal("1000"))
+        filled = await broker.get_order("coid-1")
+        assert filled is not None and filled.filled_quantity == Decimal("10")
+
+    async def test_triggering_latches(self, broker: PaperBroker) -> None:
+        """A stop that armed and then saw the price retreat stays armed —
+        venues behave this way, and a stop-loss that disarms itself is not
+        protection."""
+        await broker.submit_order(
+            make_request(
+                side=Side.SELL,
+                order_type=OrderType.STOP_LIMIT,
+                limit_price=Decimal("80"),
+                stop_price=Decimal("90"),
+                quantity=Decimal("10"),
+            )
+        )
+        # 95 is deliberately back above the 90 stop: it would not arm the
+        # order, so a fill there can only mean the earlier trigger latched.
+        # It is still through the 80 sell limit, so there is nothing else
+        # holding the fill back.
+        broker.advance_market("AAPL", Decimal("89"), Decimal("0"))  # arms, no volume
+        broker.advance_market("AAPL", Decimal("95"), Decimal("1000"))
+
+        state = await broker.get_order("coid-1")
+        assert state is not None
+        assert state.filled_quantity == Decimal("10")
+
+
+class TestTapeVolumeIsNotCountedTwice:
+    """`volume_seen` is cumulative, so subtracting only `queue_ahead` let the
+    same traded shares fill the order again on every later print — 35 shares
+    of tape filling 65 shares of order, in the optimistic direction the module
+    docstring says it exists to avoid.
+    """
+
+    async def test_an_order_cannot_fill_more_than_the_tape_traded(
+        self, clock: SimulatedClock
+    ) -> None:
+        broker = PaperBroker(
+            clock,
+            config=PaperBrokerConfig(
+                latency_ns=0, partial_fill_probability=0.0, queue_ahead_multiple=Decimal(0)
+            ),
+        )
+        await broker.submit_order(make_request(quantity=Decimal("100"), limit_price=Decimal("101")))
+
+        broker.advance_market("AAPL", Decimal("100"), Decimal("30"))
+        broker.advance_market("AAPL", Decimal("100"), Decimal("5"))
+
+        state = await broker.get_order("coid-1")
+        assert state is not None
+        assert state.filled_quantity == Decimal("35"), "filled more than 35 shares of tape"
+
+
+class TestCapabilitiesDoNotOverpromise:
+    async def test_an_unimplemented_time_in_force_is_refused_not_silently_gtc(
+        self, clock: SimulatedClock
+    ) -> None:
+        """IOC used to be advertised and then rested like a GTC. Being told
+        'unsupported' is recoverable; silently getting different semantics
+        than you asked for is not."""
+        broker = PaperBroker(clock, config=PaperBrokerConfig(latency_ns=0))
+        with pytest.raises(UnsupportedByBrokerError):
+            await broker.submit_order(make_request(time_in_force=TimeInForce.IOC))
+
+
+class TestASynchronousRejectionLeavesNoWorkingOrder:
+    async def test_a_market_order_without_a_price_does_not_stay_registered(
+        self, clock: SimulatedClock
+    ) -> None:
+        """The price lookup used to happen after the order was registered and
+        ORDER_ACCEPTED emitted, so a PermanentBrokerError left a live order
+        behind a permanent failure — a local/broker divergence manufactured by
+        the broker itself."""
+        broker = PaperBroker(clock, config=PaperBrokerConfig(latency_ns=0))
+        with pytest.raises(PermanentBrokerError):
+            await broker.submit_order(
+                make_request(symbol="MSFT", order_type=OrderType.MARKET, limit_price=None)
+            )
+
+        assert await broker.get_open_orders() == []
