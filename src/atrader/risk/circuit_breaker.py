@@ -154,13 +154,46 @@ class CircuitBreaker:
             if _LEVEL_ORDER[level] < _LEVEL_ORDER[BreakerLevel.L2]:
                 level = BreakerLevel.L2
 
-        # Never de-escalate here. Recovery is try_recover()'s job.
-        if _LEVEL_ORDER[level] < _LEVEL_ORDER[state.breaker_level]:
-            level = state.breaker_level
+        # Never de-escalate here — with one exception, applied before the
+        # hold: an L1 whose cooldown has elapsed and whose condition has
+        # cleared recovers automatically (that is L1's definition). L2/L3
+        # hold until manual_reset(); a mark-to-market bounce lifting P&L
+        # must not silently re-enable trading.
+        held = state.breaker_level
+        if held is BreakerLevel.L1 and self._l1_recovery_due(snapshot, state):
+            held = BreakerLevel.NONE
+            reasons.append(
+                f"L1 cooldown of {self._config.l1_cooldown_minutes} minutes elapsed "
+                "and the triggering condition has cleared"
+            )
+        if _LEVEL_ORDER[level] < _LEVEL_ORDER[held]:
+            level = held
             if not reasons:
                 reasons.append(f"holding at {level.value} until it is cleared")
 
+        # Persist the level and trip time onto the caller's RiskState. This
+        # is what makes the no-de-escalation hold real: the runtime hands the
+        # same RiskState back every bar, and holding against a field nobody
+        # writes would clear an L2 on the first bounced bar — precisely the
+        # silent re-enable the docstring above forbids.
+        if _LEVEL_ORDER[level] > _LEVEL_ORDER[state.breaker_level]:
+            state.breaker_tripped_ns = snapshot.now_ns
+        elif level is BreakerLevel.NONE:
+            state.breaker_tripped_ns = None
+        state.breaker_level = level
+
         return self._decision(level, tuple(triggers), "; ".join(reasons))
+
+    def _l1_recovery_due(self, snapshot: RiskSnapshot, state: RiskState) -> bool:
+        """Whether an L1 may auto-recover *right now* (cooldown + condition)."""
+        if not self._config.l1_auto_recover or state.breaker_tripped_ns is None:
+            return False
+        cooldown_ns = self._config.l1_cooldown_minutes * 60 * NS_PER_SECOND
+        if snapshot.now_ns - state.breaker_tripped_ns < cooldown_ns:
+            return False
+        if -snapshot.daily_pnl_pct >= self._config.l1_daily_loss_pct:
+            return False
+        return state.consecutive_losses < self._config.l1_consecutive_losses
 
     def _check_anomalies(self, snapshot: RiskSnapshot) -> tuple[str, str] | None:
         baseline = snapshot.baseline_orders_per_minute
@@ -224,19 +257,17 @@ class CircuitBreaker:
         Requires both that the cooldown has elapsed *and* that the triggering
         condition has actually cleared. Waiting out the clock while still losing
         money would just restart the countdown to L2.
-        """
-        if state.breaker_level is not BreakerLevel.L1 or not self._config.l1_auto_recover:
-            return None
-        if state.breaker_tripped_ns is None:
-            return None
 
-        cooldown_ns = self._config.l1_cooldown_minutes * 60 * NS_PER_SECOND
-        if snapshot.now_ns - state.breaker_tripped_ns < cooldown_ns:
+        :meth:`evaluate` performs this same recovery internally on every call,
+        so callers that evaluate each bar need not call this; it remains for
+        out-of-cycle checks.
+        """
+        if state.breaker_level is not BreakerLevel.L1:
             return None
-        if -snapshot.daily_pnl_pct >= self._config.l1_daily_loss_pct:
+        if not self._l1_recovery_due(snapshot, state):
             return None
-        if state.consecutive_losses >= self._config.l1_consecutive_losses:
-            return None
+        state.breaker_level = BreakerLevel.NONE
+        state.breaker_tripped_ns = None
 
         return BreakerDecision(
             level=BreakerLevel.NONE,
@@ -248,8 +279,20 @@ class CircuitBreaker:
             alert_level=AlertLevel.INFO,
         )
 
-    def manual_reset(self, to_level: BreakerLevel = BreakerLevel.NONE) -> BreakerDecision:
-        """Operator override. Spec §7.6 requires human approval to reach here."""
+    def manual_reset(
+        self,
+        to_level: BreakerLevel = BreakerLevel.NONE,
+        *,
+        state: RiskState | None = None,
+    ) -> BreakerDecision:
+        """Operator override. Spec §7.6 requires human approval to reach here.
+
+        Pass the live ``RiskState`` so the reset actually sticks — without it
+        the next ``evaluate`` re-holds the old level.
+        """
+        if state is not None:
+            state.breaker_level = to_level
+            state.breaker_tripped_ns = None
         return BreakerDecision(
             level=to_level,
             system_state=SystemState.RUNNING

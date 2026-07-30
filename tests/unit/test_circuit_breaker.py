@@ -303,3 +303,102 @@ class TestRemainingBranches:
 
     def test_a_kill_switch_with_no_history_reports_none(self) -> None:
         assert KillSwitch(clock=SimulatedClock()).last_event is None
+
+
+class TestTheHoldSurvivesAcrossBars:
+    """The no-de-escalation rule has to hold against state the *caller*
+    actually maintains.
+
+    It previously held against ``RiskState.breaker_level``, a field no
+    production code ever wrote — the runtime kept the prior level only in its
+    own attribute and handed ``evaluate`` a permanently-``NONE`` RiskState.
+    So an L2 tripped by a -2.5% day cleared itself on the next bar that
+    bounced back above the threshold: no human involved, ``/health`` reporting
+    RUNNING, which is precisely the silent re-enable the module docstring
+    forbids. ``evaluate`` now persists the level, so these tests drive it the
+    way the runtime does — one RiskState, reused every bar.
+    """
+
+    def test_an_l2_holds_when_the_next_bar_bounces_back(self) -> None:
+        breaker = CircuitBreaker(CircuitBreakerConfig())
+        state = RiskState()
+
+        tripped = breaker.evaluate(snapshot(daily_pnl_pct=Decimal("-2.5")), state)
+        assert tripped.level is BreakerLevel.L2
+
+        bounced = breaker.evaluate(snapshot(daily_pnl_pct=Decimal("-0.5")), state)
+        assert bounced.level is BreakerLevel.L2
+        assert "holding at" in bounced.reason
+
+    def test_it_holds_even_when_the_day_turns_profitable(self) -> None:
+        breaker = CircuitBreaker(CircuitBreakerConfig())
+        state = RiskState()
+        breaker.evaluate(snapshot(daily_pnl_pct=Decimal("-2.5")), state)
+
+        assert (
+            breaker.evaluate(snapshot(daily_pnl_pct=Decimal("1.5")), state).level is BreakerLevel.L2
+        )
+
+    def test_an_l3_never_de_escalates_either(self) -> None:
+        breaker = CircuitBreaker(CircuitBreakerConfig())
+        state = RiskState()
+        breaker.evaluate(snapshot(daily_pnl_pct=Decimal("-6")), state)
+
+        assert (
+            breaker.evaluate(snapshot(daily_pnl_pct=Decimal("0")), state).level is BreakerLevel.L3
+        )
+
+    def test_only_a_manual_reset_clears_it(self) -> None:
+        breaker = CircuitBreaker(CircuitBreakerConfig())
+        state = RiskState()
+        breaker.evaluate(snapshot(daily_pnl_pct=Decimal("-2.5")), state)
+
+        breaker.manual_reset(state=state)
+
+        assert state.breaker_level is BreakerLevel.NONE
+        assert breaker.evaluate(snapshot(daily_pnl_pct=Decimal("0")), state).level is (
+            BreakerLevel.NONE
+        )
+
+    def test_a_reset_without_the_state_does_not_stick(self) -> None:
+        """Documents the trap: manual_reset returns a decision either way, but
+        without the live state the next bar re-holds the old level."""
+        breaker = CircuitBreaker(CircuitBreakerConfig())
+        state = RiskState()
+        breaker.evaluate(snapshot(daily_pnl_pct=Decimal("-2.5")), state)
+
+        breaker.manual_reset()
+
+        assert breaker.evaluate(snapshot(daily_pnl_pct=Decimal("0")), state).level is (
+            BreakerLevel.L2
+        )
+
+
+class TestL1AutoRecoveryIsTheOneExemption:
+    """L1 is defined as auto-recovering, so the hold must not trap it — but
+    only once both the cooldown has elapsed and the condition has cleared."""
+
+    def _tripped(self) -> tuple[CircuitBreaker, RiskState]:
+        breaker = CircuitBreaker(CircuitBreakerConfig())
+        state = RiskState()
+        decision = breaker.evaluate(snapshot(daily_pnl_pct=Decimal("-1.2")), state)
+        assert decision.level is BreakerLevel.L1
+        return breaker, state
+
+    def test_it_holds_before_the_cooldown_elapses(self) -> None:
+        breaker, state = self._tripped()
+        early = snapshot(daily_pnl_pct=Decimal("-0.1"), now_ns=BASE_NS + 29 * 60 * NS_PER_SECOND)
+        assert breaker.evaluate(early, state).level is BreakerLevel.L1
+
+    def test_it_recovers_once_the_cooldown_elapses_and_the_loss_clears(self) -> None:
+        breaker, state = self._tripped()
+        later = snapshot(daily_pnl_pct=Decimal("-0.1"), now_ns=BASE_NS + 31 * 60 * NS_PER_SECOND)
+        assert breaker.evaluate(later, state).level is BreakerLevel.NONE
+        assert state.breaker_tripped_ns is None
+
+    def test_waiting_out_the_clock_while_still_losing_does_not_recover(self) -> None:
+        breaker, state = self._tripped()
+        still_losing = snapshot(
+            daily_pnl_pct=Decimal("-1.5"), now_ns=BASE_NS + 31 * 60 * NS_PER_SECOND
+        )
+        assert breaker.evaluate(still_losing, state).level is BreakerLevel.L1

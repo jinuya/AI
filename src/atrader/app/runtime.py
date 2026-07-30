@@ -367,6 +367,27 @@ class Runtime:
         self.alerts.info(component="killswitch", message=f"kill switch released: {reason}")
         return event
 
+    def reset_breaker(self, *, actor: str, reason: str) -> None:
+        """Operator path for clearing an L2/L3 circuit breaker (spec: 수동해제).
+
+        L2 and L3 hold across bars by design — nothing in the evaluation loop
+        may clear them — so without this method the only "manual reset" would
+        be restarting the process, which throws away every other piece of
+        state along with the breaker.
+        """
+        decision = self.circuit_breaker.manual_reset(state=self._risk_state)
+        self._breaker_level = decision.level
+        self._system_state = decision.system_state
+        self.metrics.circuit_breaker_level.set(_BREAKER_LEVEL_NUM[self._breaker_level])
+        self.audit.append(
+            AuditEvent.CIRCUIT_BREAKER_RESET,
+            actor=actor,
+            payload={"reason": reason, "to_level": decision.level.value},
+        )
+        self.alerts.warn(
+            component="circuit_breaker", message=f"manually reset by {actor}: {reason}"
+        )
+
     async def _liquidate_all(self) -> None:
         positions = {p.symbol: p for p in await self.broker.get_positions()}
         account = await self.broker.get_account()
@@ -611,11 +632,10 @@ class Runtime:
     ) -> None:
         """Evaluate the circuit breaker exactly once per bar (see module docstring)."""
         prelim = self._snapshot(at_ns, account, positions)
+        # evaluate() persists the level and trip time into self._risk_state,
+        # which is what makes L2/L3 hold across bars (they clear only via
+        # reset_breaker) and lets L1 auto-recover after its cooldown.
         decision = self.circuit_breaker.evaluate(prelim, self._risk_state)
-        if not decision.tripped:
-            recovered = self.circuit_breaker.try_recover(prelim, self._risk_state)
-            if recovered is not None:
-                decision = recovered
 
         self._breaker_level = decision.level
         self._system_state = decision.system_state

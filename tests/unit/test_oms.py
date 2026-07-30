@@ -18,6 +18,7 @@ import pytest
 
 from atrader.audit.logger import AuditEvent, AuditLogger
 from atrader.brokers.faults import Fault, FaultInjector, FaultyBroker, ScriptedFaults
+from atrader.brokers.models import BrokerEvent, BrokerEventType, CancelAck
 from atrader.brokers.paper import PaperBroker, PaperBrokerConfig
 from atrader.core.clock import SimulatedClock
 from atrader.core.ids import DeterministicIdGenerator
@@ -575,3 +576,162 @@ class TestOrdersNeedingCancel:
         order = make_order(status=OrderStatus.NEW, parent_intent_id=None)
         stale = orders_needing_cancel([order], now_ns=BASE_NS + 10, valid_until={})
         assert stale == []
+
+
+class _AcceptsEveryCancel:
+    """Cancel acks unconditionally. The shipped paper broker only knows
+    orders it actually received, so it refuses cancels for the hand-built
+    ones these tests need — which would mask the behaviour under test."""
+
+    async def cancel_order(self, client_order_id: str) -> CancelAck:
+        return CancelAck(client_order_id=client_order_id, accepted=True)
+
+
+class TestCancellingAnUnacknowledgedOrder:
+    """`PENDING_NEW` is an open status, so `cancel()` accepts it — but the
+    transition table has no `PENDING_NEW -> PENDING_CANCEL` edge (there is no
+    venue-side order yet to hold in a cancel-pending state). It goes straight
+    to CANCELED, which is the edge the table's own comment describes as
+    existing for "the kill switch fires between submission and ack".
+
+    Before the fix `cancel()` forced the PENDING_CANCEL step and raised, and
+    `cancel_all` — the kill switch's sweep — had no per-order isolation, so
+    one such order aborted the whole sweep and left every later order working.
+    """
+
+    async def test_a_pending_new_order_cancels(
+        self,
+        storage: InMemoryStorage,
+        clock: SimulatedClock,
+        ids: DeterministicIdGenerator,
+        audit: AuditLogger,
+    ) -> None:
+        oms = make_oms(storage, clock, ids, audit, broker=_AcceptsEveryCancel())  # type: ignore[arg-type]
+        order = make_order().model_copy(update={"status": OrderStatus.PENDING_NEW})
+        storage.orders.upsert(order)
+
+        canceled = await oms.cancel(order)
+
+        assert canceled.status is OrderStatus.CANCELED
+
+    async def test_the_kill_switch_sweep_does_not_stop_at_the_first_problem(
+        self,
+        storage: InMemoryStorage,
+        clock: SimulatedClock,
+        ids: DeterministicIdGenerator,
+        audit: AuditLogger,
+    ) -> None:
+        """The property that matters is not "every cancel succeeds" — it is
+        that a sweep which cannot cancel one order still cancels the rest.
+        Stopping halfway is strictly the worst outcome: nobody outside can
+        tell where it stopped."""
+        oms = make_oms(storage, clock, ids, audit, broker=_AcceptsEveryCancel())  # type: ignore[arg-type]
+        first = make_order().model_copy(
+            update={"client_order_id": "unacked", "status": OrderStatus.PENDING_NEW}
+        )
+        second = make_order().model_copy(
+            update={"client_order_id": "acked", "status": OrderStatus.NEW}
+        )
+        storage.orders.upsert(first)
+        storage.orders.upsert(second)
+
+        await oms.cancel_all()
+
+        assert storage.orders.open_orders() == []
+
+    async def test_a_broker_that_raises_on_one_order_does_not_strand_the_others(
+        self,
+        storage: InMemoryStorage,
+        clock: SimulatedClock,
+        ids: DeterministicIdGenerator,
+        audit: AuditLogger,
+    ) -> None:
+        class OneBadCancel:
+            async def cancel_order(self, client_order_id: str):  # type: ignore[no-untyped-def]
+                from atrader.brokers.models import CancelAck
+
+                if client_order_id == "boom":
+                    raise RuntimeError("broker refused")
+                return CancelAck(client_order_id=client_order_id, accepted=True)
+
+        oms = make_oms(storage, clock, ids, audit, broker=OneBadCancel())  # type: ignore[arg-type]
+        for coid in ("boom", "fine"):
+            storage.orders.upsert(
+                make_order().model_copy(update={"client_order_id": coid, "status": OrderStatus.NEW})
+            )
+
+        canceled = await oms.cancel_all()
+
+        assert [o.client_order_id for o in canceled] == ["fine"]
+        assert [o.client_order_id for o in storage.orders.open_orders()] == ["boom"]
+
+
+class TestQueryDiscoveredFillsAreNotCountedTwice:
+    """`_adopt_broker_state` learns a filled_quantity from a *query*, which
+    carries no fill ids. When the event stream later delivers those same
+    executions their ids are new, so the fill-id dedup passes and the shares
+    are counted a second time — an order recorded FILLED while half of it is
+    still working at the venue, invisible to `cancel_all`, and the real
+    remaining fill then crashes the consumer with an overfill.
+    """
+
+    async def test_the_stream_redelivery_of_an_adopted_fill_is_absorbed(
+        self,
+        storage: InMemoryStorage,
+        clock: SimulatedClock,
+        ids: DeterministicIdGenerator,
+        audit: AuditLogger,
+    ) -> None:
+        inner = make_paper(clock)
+        faulty = FaultyBroker(
+            inner=inner, injector=FaultInjector(scripted=ScriptedFaults.of(Fault.AMBIGUOUS))
+        )
+        oms = make_oms(storage, clock, ids, audit, broker=faulty)
+        order = make_order(order_type=OrderType.MARKET, limit_price=None, quantity=Decimal("5"))
+
+        report = await oms.submit(order)
+        assert report.order.filled_quantity == Decimal("5")
+
+        # The same execution now arrives on the stream, as it would.
+        oms.apply_event(
+            BrokerEvent(
+                event_type=BrokerEventType.FILL,
+                client_order_id=order.client_order_id,
+                broker_fill_id="stream-1",
+                quantity=Decimal("5"),
+                price=Decimal("100"),
+                at_ns=clock.now_ns(),
+            )
+        )
+
+        stored = storage.orders.get(order.order_id)
+        assert stored is not None
+        assert stored.filled_quantity == Decimal("5"), "adopted quantity was counted twice"
+
+    async def test_a_genuinely_new_fill_beyond_the_adopted_amount_still_applies(
+        self,
+        storage: InMemoryStorage,
+        clock: SimulatedClock,
+        ids: DeterministicIdGenerator,
+        audit: AuditLogger,
+    ) -> None:
+        """Absorption must consume only what the query already told us."""
+        oms = make_oms(storage, clock, ids, audit)
+        order = make_order(quantity=Decimal("10")).model_copy(update={"status": OrderStatus.NEW})
+        storage.orders.upsert(order)
+        oms._query_credit[order.client_order_id] = Decimal("4")
+
+        oms.apply_event(
+            BrokerEvent(
+                event_type=BrokerEventType.FILL,
+                client_order_id=order.client_order_id,
+                broker_fill_id="stream-1",
+                quantity=Decimal("6"),
+                price=Decimal("100"),
+                at_ns=clock.now_ns(),
+            )
+        )
+
+        stored = storage.orders.get(order.order_id)
+        assert stored is not None
+        assert stored.filled_quantity == Decimal("2"), "only the 4 adopted shares absorb"

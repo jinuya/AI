@@ -36,7 +36,7 @@ from atrader.execution.idempotency import (
     SubmitPolicy,
     submit_with_retry,
 )
-from atrader.execution.statemachine import apply_fill, transition
+from atrader.execution.statemachine import apply_fill, can_transition, transition
 from atrader.storage.protocol import FillStore, OrderStore
 
 __all__ = ["OrderManager", "SubmitReport"]
@@ -68,6 +68,9 @@ class OrderManager:
     audit: AuditLogger | None = None
     submit_policy: SubmitPolicy = field(default_factory=SubmitPolicy)
     _locked_symbols: set[str] = field(default_factory=set)
+    #: client_order_id -> quantity learned from a broker *query* rather than
+    #: from the event stream. See :meth:`_apply_fill_event`.
+    _query_credit: dict[str, Decimal] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Submission
@@ -138,9 +141,19 @@ class OrderManager:
             if result.ack is not None
             else (result.broker_state.broker_order_id if result.broker_state else None)
         )
-        accepted = order.model_copy(
+        # Re-read rather than reusing the pre-await `order`. A marketable
+        # order's fill routinely arrives on the event stream before the REST
+        # ack returns; `apply_event` has already written it, and rebuilding
+        # from the stale copy would reset a FILLED order to NEW/0. The fill
+        # cannot repair itself afterwards either — FillStore dedup drops the
+        # redelivery — so the order would stay permanently open and unfilled.
+        current = self.orders.get_by_client_order_id(order.client_order_id) or order
+        # Only PENDING_NEW still needs the ack's NEW; anything further along
+        # (PARTIALLY_FILLED, FILLED, CANCELED) already supersedes it.
+        status = OrderStatus.NEW if current.status is OrderStatus.PENDING_NEW else current.status
+        accepted = current.model_copy(
             update={
-                "status": OrderStatus.NEW,
+                "status": status,
                 "broker_order_id": broker_order_id,
                 "updated_at_ns": now,
             }
@@ -164,16 +177,32 @@ class OrderManager:
             return order
 
         now = self.clock.now_ns()
-        pending = transition(order, OrderStatus.PENDING_CANCEL, now_ns=now)
-        self.orders.upsert(pending)
+        if can_transition(order.status, OrderStatus.PENDING_CANCEL):
+            pending = transition(order, OrderStatus.PENDING_CANCEL, now_ns=now)
+            self.orders.upsert(pending)
+        else:
+            # PENDING_NEW: the venue has not acknowledged the order, so there
+            # is nothing to hold in PENDING_CANCEL — the table goes straight
+            # to CANCELED for exactly this case ("the kill switch fires
+            # between submission and ack"). Forcing the intermediate step
+            # raised IllegalStateTransitionError and, through cancel_all,
+            # aborted the kill switch mid-sweep.
+            pending = order
 
         ack = await self.broker.cancel_order(order.client_order_id)
+        # Re-read: a fill can land on the event stream while the cancel is in
+        # flight — cancels lose races, and the fill is real when they do.
+        # Transitioning from the pre-await copy would erase it.
+        current = self.orders.get_by_client_order_id(order.client_order_id) or pending
         if not ack.accepted:
             # Usually "already filled" — normal, not an error.
-            self._log(AuditEvent.ORDER_STATE_CHANGED, pending, extra={"cancel_reason": ack.reason})
-            return pending
+            self._log(AuditEvent.ORDER_STATE_CHANGED, current, extra={"cancel_reason": ack.reason})
+            return current
+        if not current.is_open:
+            # The race went the other way and the order is already terminal.
+            return current
 
-        canceled = transition(pending, OrderStatus.CANCELED, now_ns=self.clock.now_ns())
+        canceled = transition(current, OrderStatus.CANCELED, now_ns=self.clock.now_ns())
         self.orders.upsert(canceled)
         self._log(AuditEvent.ORDER_CANCELED, canceled)
         return canceled
@@ -187,7 +216,20 @@ class OrderManager:
         for order in self.orders.open_orders():
             if symbol is not None and order.symbol != symbol:
                 continue
-            canceled.append(await self.cancel(order))
+            try:
+                canceled.append(await self.cancel(order))
+            except Exception as exc:
+                # One order that cannot be cancelled must not leave the rest
+                # working. This is the kill switch's sweep: aborting halfway
+                # is the worst outcome available, strictly worse than either
+                # cancelling all or cancelling none, because nobody can tell
+                # from the outside where it stopped. The failure is recorded
+                # at CRITICAL and the sweep continues.
+                self._log(
+                    AuditEvent.ORDER_STATE_CHANGED,
+                    order,
+                    extra={"cancel_failed": str(exc)},
+                )
         return canceled
 
     # ------------------------------------------------------------------
@@ -255,6 +297,27 @@ class OrderManager:
         if not self.fills.append(fill):
             return order
 
+        # Second deduplication axis: quantity we already took from a broker
+        # *query* rather than from this stream. `_adopt_broker_state` learns a
+        # filled_quantity with no fill ids attached, so when the stream later
+        # delivers those same executions their ids are new, the check above
+        # passes, and the shares get counted twice — an order recorded FILLED
+        # while half of it is still working at the venue, invisible to
+        # cancel_all. The credit is exactly the quantity adopted, so absorbing
+        # against it consumes the re-deliveries and lets genuinely new fills
+        # through.
+        credit = self._query_credit.get(order.client_order_id, ZERO)
+        if credit > ZERO:
+            absorbed = min(credit, fill.quantity)
+            remaining = credit - absorbed
+            if remaining > ZERO:
+                self._query_credit[order.client_order_id] = remaining
+            else:
+                self._query_credit.pop(order.client_order_id, None)
+            if absorbed >= fill.quantity:
+                return order  # wholly a re-delivery of what the query told us
+            fill = fill.model_copy(update={"quantity": fill.quantity - absorbed})
+
         updated = apply_fill(order, fill, now_ns=now_ns)
         self.orders.upsert(updated)
         self._log(
@@ -276,7 +339,25 @@ class OrderManager:
         if not isinstance(state, OrderState):  # pragma: no cover — defensive
             return order
         if state.filled_quantity <= ZERO:
+            # Nothing filled, but the broker's status is still the truth: an
+            # order the venue has expired or cancelled must not be recorded
+            # locally as working, or cancel_all will keep trying to cancel a
+            # ghost while reconciliation reports a break.
+            if state.status is not order.status and not state.status.is_open:
+                closed = order.model_copy(
+                    update={"status": state.status, "updated_at_ns": self.clock.now_ns()}
+                )
+                self.orders.upsert(closed)
+                return closed
             return order
+
+        # Record what we learned from the query so the stream's delivery of
+        # these same executions is absorbed rather than double-counted.
+        gap = state.filled_quantity - order.filled_quantity
+        if gap > ZERO:
+            self._query_credit[order.client_order_id] = (
+                self._query_credit.get(order.client_order_id, ZERO) + gap
+            )
 
         updated = order.model_copy(
             update={
