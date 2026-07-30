@@ -18,7 +18,7 @@ from uuid import UUID
 from sqlalchemy import Engine, Row, create_engine, delete, select
 from sqlalchemy.exc import IntegrityError
 
-from atrader.audit.hashchain import AuditRecord
+from atrader.audit.hashchain import AuditRecord, canonical_json
 from atrader.core.models import Fill, Order, Position, TradingIntent
 from atrader.core.types import OrderStatus
 from atrader.storage.sql.schema import (
@@ -217,7 +217,12 @@ class SqlAuditSink:
                     seq=record.seq,
                     event_type=record.event_type,
                     actor=record.actor,
-                    payload=json.dumps(record.payload, sort_keys=True, default=str),
+                    # The same serializer the hash was computed with. `default=str`
+                    # renders bytes as "b'\\x01'" and a set as "{'a'}",
+                    # neither of which reads back as what was hashed — so an
+                    # untouched record failed verify_chain, indistinguishable
+                    # from real tampering.
+                    payload=canonical_json(record.payload).decode("utf-8"),
                     prev_hash=record.prev_hash,
                     hash=record.hash,
                     created_at_ns=record.created_at_ns,

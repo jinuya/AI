@@ -63,12 +63,26 @@ class GuardResult:
 
 
 def _parse_decimal(raw: str | None) -> Decimal | None:
+    """Parse a model-supplied number, or ``None`` if it is not one.
+
+    ``is_finite`` is the part that matters: ``Decimal("NaN")``,
+    ``Decimal("sNaN")`` and ``Decimal("Infinity")`` all construct *without*
+    raising, and every one of them is reachable from a schema-valid response
+    because the wire format carries decimals as strings. A NaN then raises
+    ``InvalidOperation`` from the very range checks below (NaN has no
+    ordering), and an Infinity slips past them to fail inside pydantic —
+    either way an exception escapes ``apply_guards`` instead of a
+    ``GuardRejection``, taking the whole cycle with it and discarding the
+    legitimate decisions alongside the crafted one. The deterministic guard
+    layer must fail closed, never fail loudly.
+    """
     if raw is None:
         return None
     try:
-        return Decimal(raw)
-    except InvalidOperation:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError, TypeError):
         return None
+    return value if value.is_finite() else None
 
 
 def _within_band(price: Decimal, reference: Decimal) -> bool:

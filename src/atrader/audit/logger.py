@@ -125,6 +125,13 @@ def _sanitise(value: object, key: str = "") -> object:
     if isinstance(value, str):
         return "***REDACTED***" if is_sensitive_key(key) else redact(value)
     if isinstance(value, dict):
+        # A sensitive *parent* key stays sensitive all the way down. Recursing
+        # with only the inner key threw the context away, so a secret shaped
+        # {"password": {"value": ...}} was written verbatim — and, being
+        # hashed in, could not be removed for seven years without breaking
+        # the chain. Lists already propagated the key; dicts did not.
+        if is_sensitive_key(key):
+            return "***REDACTED***"
         return {str(k): _sanitise(v, str(k)) for k, v in value.items()}
     if isinstance(value, list | tuple):
         return [_sanitise(item, key) for item in value]

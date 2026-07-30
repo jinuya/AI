@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from atrader.core.clock import SimulatedClock
 from atrader.core.ids import DeterministicIdGenerator
 from atrader.core.models import AccountState
@@ -239,3 +241,44 @@ class TestIntentConstruction:
         assert result.intents[0].symbol == "AAPL"
         assert len(result.rejections) == 1
         assert result.rejections[0].symbol == "MSFT"
+
+
+class TestDecimalSpecialValuesAreRejectedNotCrashed:
+    """The wire format carries numbers as strings, and ``Decimal("NaN")`` /
+    ``Decimal("Infinity")`` construct without raising — so both are reachable
+    from a schema-valid response. A NaN then raises ``InvalidOperation`` from
+    the range checks (NaN has no ordering) and an Infinity survives them to
+    fail inside pydantic. Either way an exception escaped ``apply_guards``
+    instead of a rejection, taking the whole cycle down and discarding the
+    legitimate decisions alongside the crafted one.
+
+    The deterministic guard layer is the enforcement point (the prompt tags
+    are the weak first line), so it has to fail closed, never fail loudly.
+    """
+
+    @pytest.mark.parametrize("value", ["NaN", "sNaN", "Infinity", "inf", "-inf", "-Infinity"])
+    def test_a_special_quantity_is_a_rejection(self, value: str) -> None:
+        result = guard(decide(quantity=value))
+        assert result.intents == ()
+        assert len(result.rejections) == 1
+
+    @pytest.mark.parametrize("value", ["NaN", "sNaN", "Infinity", "-inf"])
+    def test_a_special_confidence_is_a_rejection(self, value: str) -> None:
+        result = guard(decide(confidence=value))
+        assert result.intents == ()
+        assert len(result.rejections) == 1
+
+    @pytest.mark.parametrize("field", ["stop_loss", "take_profit"])
+    def test_a_special_price_does_not_crash(self, field: str) -> None:
+        result = guard(decide(**{field: "NaN"}))
+        assert isinstance(result.rejections, tuple)
+
+    def test_one_crafted_decision_does_not_destroy_the_others(self) -> None:
+        """The failure mode that made this worth fixing: a single poisoned
+        decision aborted the whole batch before any legitimate intent was
+        built."""
+        result = guard(decide(quantity="NaN"), decide(quantity="10"))
+
+        assert len(result.intents) == 1
+        assert result.intents[0].target_value == Decimal("10")
+        assert len(result.rejections) == 1

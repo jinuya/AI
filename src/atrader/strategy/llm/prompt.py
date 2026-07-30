@@ -83,12 +83,22 @@ def render_untrusted(label: str, text: str) -> str:
     The text is escaped for the tag's own delimiters first — otherwise
     untrusted content containing a literal ``</untrusted_data>`` could close
     the tag early and splice attacker text back into the "trusted" region.
+
+    The *label* gets the same treatment, not just quote-stripping. It names
+    the source of the content (a news provider, a filing feed), which makes
+    it untrusted too, and a label carrying its own ``</untrusted_data>``
+    emitted a second real closing tag inside the ``source="..."`` attribute —
+    the identical breakout, through the one field that was not escaped.
     """
-    escaped = text.replace(UNTRUSTED_OPEN, "&lt;untrusted_data").replace(
+    escaped = _escape_tags(text)
+    safe_label = _escape_tags(label).replace('"', "'")
+    return f'{UNTRUSTED_OPEN} source="{safe_label}">\n{escaped}\n{UNTRUSTED_CLOSE}'
+
+
+def _escape_tags(value: str) -> str:
+    return value.replace(UNTRUSTED_OPEN, "&lt;untrusted_data").replace(
         UNTRUSTED_CLOSE, "&lt;/untrusted_data&gt;"
     )
-    safe_label = label.replace('"', "'")
-    return f'{UNTRUSTED_OPEN} source="{safe_label}">\n{escaped}\n{UNTRUSTED_CLOSE}'
 
 
 def build_user_content(

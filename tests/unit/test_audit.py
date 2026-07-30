@@ -8,6 +8,7 @@ document it cannot trust.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -206,3 +207,72 @@ class TestSqlAuditSink:
             assert resumed.verify().valid
         finally:
             reopened.close()
+
+
+class TestTheGenesisAnchorIsChecked:
+    """Deleting the *earliest* records used to verify clean: the walk started
+    from whatever the first surviving record claimed, so ``GENESIS_HASH``
+    anchored nothing. That is the first edit anyone with database access would
+    make — the opening records are the ones that say how a session began.
+    """
+
+    def _chain(self, sink: InMemoryAuditSink) -> list[AuditRecord]:
+        log = AuditLogger(sink, SimulatedClock(start_ns=1_000))
+        for index in range(6):
+            log.append(AuditEvent.ORDER_ACK, payload={"n": index})
+        return sink.read_all()
+
+    def test_a_full_chain_verifies(self) -> None:
+        records = self._chain(InMemoryAuditSink())
+        assert verify_chain(records).valid is True
+
+    def test_dropping_the_first_records_is_caught(self) -> None:
+        records = self._chain(InMemoryAuditSink())
+        result = verify_chain(records[3:])
+        assert result.valid is False
+        assert "genesis" in result.reason
+
+    def test_dropping_only_the_very_first_record_is_caught(self) -> None:
+        records = self._chain(InMemoryAuditSink())
+        assert verify_chain(records[1:]).valid is False
+
+    def test_a_deliberate_slice_can_opt_out(self) -> None:
+        """An export that starts mid-run is a legitimate thing to verify —
+        linkage inside the slice is still fully checked."""
+        records = self._chain(InMemoryAuditSink())
+        assert verify_chain(records[3:], expect_genesis=False).valid is True
+
+    def test_the_opt_out_still_catches_tampering_inside_the_slice(self) -> None:
+        records = self._chain(InMemoryAuditSink())
+        sliced = records[2:]
+        sliced[1] = replace(sliced[1], payload={"n": 999})
+        assert verify_chain(sliced, expect_genesis=False).valid is False
+
+
+class TestNestedSecretsAreMasked:
+    def test_a_dict_under_a_sensitive_key_is_redacted(self) -> None:
+        """Lists already propagated the parent key; dicts threw it away, so
+        {"password": {"value": ...}} was written verbatim — and hashed in,
+        making it unremovable for the seven-year retention without breaking
+        the chain."""
+        sink = InMemoryAuditSink()
+        AuditLogger(sink, SimulatedClock(start_ns=1_000)).append(
+            AuditEvent.CONFIG_CHANGED,
+            payload={
+                "api_key": "RAW-TOP",
+                "token": ["RAW-IN-LIST"],
+                "password": {"value": "RAW-IN-DICT"},
+            },
+        )
+
+        stored = sink.read_all()[0].payload
+        assert "RAW-IN-DICT" not in str(stored)
+        assert "RAW-IN-LIST" not in str(stored)
+        assert "RAW-TOP" not in str(stored)
+
+    def test_an_ordinary_nested_dict_is_still_recorded(self) -> None:
+        sink = InMemoryAuditSink()
+        AuditLogger(sink, SimulatedClock(start_ns=1_000)).append(
+            AuditEvent.ORDER_ACK, payload={"detail": {"symbol": "AAPL"}}
+        )
+        assert sink.read_all()[0].payload["detail"] == {"symbol": "AAPL"}

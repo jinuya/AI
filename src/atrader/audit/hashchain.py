@@ -141,15 +141,41 @@ class ChainVerification:
         return self.valid
 
 
-def verify_chain(records: list[AuditRecord]) -> ChainVerification:
+def verify_chain(records: list[AuditRecord], *, expect_genesis: bool = True) -> ChainVerification:
     """Verify hashes and linkage across an ordered run of records.
 
-    Checks three things, in the order that makes a failure easiest to diagnose:
-    contiguous sequence numbers, each record's own hash, and each record's link
-    to its predecessor.
+    Checks four things, in the order that makes a failure easiest to diagnose:
+    that the run starts at the genesis anchor, contiguous sequence numbers,
+    each record's own hash, and each record's link to its predecessor.
+
+    The anchor check is what makes deleting the *earliest* records detectable.
+    Without it the walk simply started from whatever the first surviving
+    record claimed, so ``DELETE FROM audit_log WHERE seq <= 3`` produced a log
+    that verified clean — the one edit an attacker with database access would
+    reach for first, since the opening records are the ones that say how the
+    session began. ``GENESIS_HASH`` anchors nothing unless something asserts
+    it is there.
+
+    Pass ``expect_genesis=False`` to verify a deliberate slice of a longer
+    chain (an export starting mid-run); linkage within the slice is still
+    fully checked, but head truncation is then indistinguishable from an
+    intentional window and cannot be detected.
     """
     if not records:
         return ChainVerification(valid=True, records_checked=0)
+
+    if expect_genesis and (records[0].seq != 1 or records[0].prev_hash != GENESIS_HASH):
+        return ChainVerification(
+            valid=False,
+            records_checked=0,
+            first_bad_seq=records[0].seq,
+            reason=(
+                f"the log does not start at genesis: first record is seq {records[0].seq} "
+                f"with prev_hash {records[0].prev_hash.hex()[:16]}.... Records before it "
+                "have been removed, or this is a slice of a longer chain "
+                "(pass expect_genesis=False if that is intended)."
+            ),
+        )
 
     expected_prev = records[0].prev_hash
     expected_seq = records[0].seq
