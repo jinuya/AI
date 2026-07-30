@@ -225,3 +225,70 @@ class TestMissingPrice:
         netted, conflicts = net([a, b], prices={}, deadband_pct=Decimal("50"))
         assert netted == []
         assert conflicts[0].net_shares == Decimal("0")
+
+
+class TestAbsoluteTargetsChargeThePositionOnce:
+    """``TARGET_WEIGHT`` states an absolute target, so converting it to a
+    share delta subtracts what is already held. Summing several such deltas
+    subtracted the position once *per intent*, and the surplus flipped the
+    netted order against every strategy that contributed to it.
+    """
+
+    def weight(self, strategy_id: str, target: str) -> TradingIntent:
+        return make_intent(
+            strategy_id=strategy_id,
+            side=Side.BUY,
+            target_type=TargetType.TARGET_WEIGHT,
+            target_value=Decimal(target),
+        )
+
+    def test_two_long_targets_do_not_produce_a_short(self) -> None:
+        """Both strategies want to be long 10% of a book already long 25%.
+        The netted order must trim toward the targets, never cross zero."""
+        positions = {"AAPL": Position(symbol="AAPL", quantity=Decimal("250"))}
+        netted, _ = net([self.weight("a", "0.10"), self.weight("b", "0.10")], positions=positions)
+
+        (order,) = netted
+        resulting = Decimal("250") + order.target_value * order.side.sign
+        assert resulting > 0, "netted order flipped the book short"
+        assert resulting == Decimal("200"), "20% — the two 10% targets, summed"
+
+    def test_targets_that_together_exceed_the_holding_still_buy(self) -> None:
+        positions = {"AAPL": Position(symbol="AAPL", quantity=Decimal("100"))}
+        netted, _ = net([self.weight("a", "0.10"), self.weight("b", "0.10")], positions=positions)
+
+        (order,) = netted
+        assert order.side is Side.BUY
+        assert Decimal("100") + order.target_value * order.side.sign == Decimal("200")
+
+    def test_a_single_weight_intent_is_unchanged(self) -> None:
+        """One intent is passed through untouched — the correction only
+        applies when several absolute targets are being combined."""
+        positions = {"AAPL": Position(symbol="AAPL", quantity=Decimal("250"))}
+        netted, _ = net([self.weight("a", "0.10")], positions=positions)
+
+        (passed_through,) = netted
+        assert passed_through.target_type is TargetType.TARGET_WEIGHT
+        assert passed_through.target_value == Decimal("0.10")
+
+    def test_a_flat_book_nets_the_targets_directly(self) -> None:
+        netted, _ = net([self.weight("a", "0.10"), self.weight("b", "0.05")])
+
+        (order,) = netted
+        assert order.side is Side.BUY
+        assert order.target_value == Decimal("150")  # 15% of 100k at 100
+
+    def test_share_deltas_are_not_affected(self) -> None:
+        """SHARES intents are already deltas; nothing is charged to them."""
+        positions = {"AAPL": Position(symbol="AAPL", quantity=Decimal("250"))}
+        netted, _ = net(
+            [
+                make_intent(strategy_id="a", side=Side.BUY, target_value=Decimal("30")),
+                make_intent(strategy_id="b", side=Side.BUY, target_value=Decimal("20")),
+            ],
+            positions=positions,
+        )
+
+        (order,) = netted
+        assert order.side is Side.BUY
+        assert order.target_value == Decimal("50")

@@ -74,10 +74,16 @@ class PnLReport:
 
     @property
     def net_pnl(self) -> Decimal:
-        """What actually hit the account: trading P&L minus every real cost."""
-        return (
-            self.gross_trading_pnl - self.commission - self.tax - self.borrow_cost
-        ) + self.fx_adjustment
+        """What actually hit the account: trading P&L minus every real cost.
+
+        ``fx_adjustment`` is deliberately *not* added. It reports how much of
+        ``gross_trading_pnl`` came from the currency rather than the trade —
+        and ``realized_pnl``/``unrealized_pnl`` are already converted at that
+        rate, so gross contains it. Adding it again inflated the figure by the
+        currency component twice over: 100 EUR realized at 1.08 arrives as 108
+        USD in the account, and this reported 116.
+        """
+        return self.gross_trading_pnl - self.commission - self.tax - self.borrow_cost
 
 
 def mark_to_market(

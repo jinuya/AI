@@ -10,6 +10,7 @@ import pytest
 from atrader.core.clock import SimulatedClock
 from atrader.core.models import Fill
 from atrader.core.types import CostBasisMethod, Side
+from atrader.portfolio.pnl import mark_to_market
 from atrader.portfolio.positions import PositionBook
 from atrader.storage.memory import InMemoryPositionStore
 
@@ -195,3 +196,95 @@ class TestFifoCostBasis:
         fresh_book.rebuild(fills)
 
         assert fresh_store.get("AAPL") == expected
+
+
+class TestAClosedPositionCarriesNoUnrealizedPnl:
+    """`mark_to_market` skips flat positions, so a mark left on a position
+    that later closes was never cleared. Every consumer reporting
+    realized + unrealized (``net_pnl_report``, ``Runtime.pnl_snapshot``) then
+    counted the whole round trip twice: once as realized, once as an
+    unrealized figure for a position that no longer exists.
+    """
+
+    def test_flattening_clears_the_stale_mark(
+        self, store: InMemoryPositionStore, clock: SimulatedClock
+    ) -> None:
+        book = PositionBook(store=store, clock=clock, method=CostBasisMethod.AVERAGE)
+        book.apply_fill(make_fill(side=Side.BUY, quantity="100", price="100"))
+        mark_to_market(store, {"AAPL": Decimal("110")}, now_ns=BASE_NS)
+        assert store.get("AAPL").unrealized_pnl == Decimal("1000")  # type: ignore[union-attr]
+
+        book.apply_fill(make_fill(side=Side.SELL, quantity="100", price="110"))
+
+        closed = store.get("AAPL")
+        assert closed is not None
+        assert closed.realized_pnl == Decimal("1000")
+        assert closed.unrealized_pnl == Decimal("0")
+        assert closed.realized_pnl + closed.unrealized_pnl == Decimal("1000")
+
+    def test_reopening_does_not_inherit_the_previous_cycles_mark(
+        self, store: InMemoryPositionStore, clock: SimulatedClock
+    ) -> None:
+        book = PositionBook(store=store, clock=clock, method=CostBasisMethod.AVERAGE)
+        book.apply_fill(make_fill(side=Side.BUY, quantity="100", price="100"))
+        mark_to_market(store, {"AAPL": Decimal("110")}, now_ns=BASE_NS)
+        book.apply_fill(make_fill(side=Side.SELL, quantity="100", price="110"))
+
+        book.apply_fill(make_fill(side=Side.BUY, quantity="50", price="120"))
+
+        reopened = store.get("AAPL")
+        assert reopened is not None
+        assert reopened.unrealized_pnl == Decimal("0")
+
+
+class TestRebuildResetsTheStoreNotJustTheLots:
+    """`rebuild` is the startup-recovery path (spec §10.4). Clearing only the
+    in-memory lots left the *stored* position in place, so replaying fills
+    against a persistent store applied each one on top of state that already
+    contained it.
+    """
+
+    FILLS = (
+        ("BUY", "100", "100"),
+        ("SELL", "40", "110"),
+    )
+
+    def _replay(self, book: PositionBook) -> None:
+        book.rebuild(
+            [
+                make_fill(side=Side[s], quantity=q, price=p, at_ns=BASE_NS + i)
+                for i, (s, q, p) in enumerate(self.FILLS)
+            ]
+        )
+
+    @pytest.mark.parametrize("method", [CostBasisMethod.AVERAGE, CostBasisMethod.FIFO])
+    def test_replaying_onto_a_populated_store_is_idempotent(
+        self, store: InMemoryPositionStore, clock: SimulatedClock, method: CostBasisMethod
+    ) -> None:
+        first = PositionBook(store=store, clock=clock, method=method)
+        self._replay(first)
+        after_first = store.get("AAPL")
+        assert after_first is not None
+
+        # A fresh book over the same (persistent) store — restart recovery.
+        second = PositionBook(store=store, clock=clock, method=method)
+        self._replay(second)
+
+        after_second = store.get("AAPL")
+        assert after_second is not None
+        assert after_second.quantity == after_first.quantity == Decimal("60")
+        assert after_second.realized_pnl == after_first.realized_pnl
+
+    @pytest.mark.parametrize("method", [CostBasisMethod.AVERAGE, CostBasisMethod.FIFO])
+    def test_quantity_still_equals_the_signed_sum_of_fills(
+        self, store: InMemoryPositionStore, clock: SimulatedClock, method: CostBasisMethod
+    ) -> None:
+        """The invariant the property suite pins — it must survive a replay."""
+        PositionBook(store=store, clock=clock, method=method).apply_fill(
+            make_fill(side=Side.BUY, quantity="100", price="100")
+        )
+        self._replay(PositionBook(store=store, clock=clock, method=method))
+
+        position = store.get("AAPL")
+        assert position is not None
+        assert position.quantity == Decimal("60")  # 100 - 40

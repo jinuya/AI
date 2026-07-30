@@ -107,6 +107,7 @@ def net_intents(
         price = prices.get(symbol)
         position = positions.get(symbol)
         deltas = [_to_share_delta(intent, position, price, equity) for intent in group]
+        deltas = _share_the_current_position(deltas, group, position)
         gross = sum((abs(d) for d in deltas), ZERO)
         net = sum(deltas, ZERO)
 
@@ -128,6 +129,38 @@ def net_intents(
         netted.append(_synthesize(symbol, group, deltas, net, ids, clock))
 
     return netted, conflicts
+
+
+def _share_the_current_position(
+    deltas: list[Decimal],
+    group: list[TradingIntent],
+    position: Position | None,
+) -> list[Decimal]:
+    """Charge the existing position to the weight targets exactly once.
+
+    ``TARGET_WEIGHT`` states an *absolute* target, so converting it to a share
+    delta means subtracting what is already held. Summing several such deltas
+    subtracted the current position once per intent, and the surplus flipped
+    the netted order against everyone who contributed to it: two strategies
+    both asking to be long 10% of a book already long 25% produced deltas of
+    (-150, -150) and a net SELL 300 — landing 5% *short*, which no strategy
+    asked for.
+
+    Each weight intent is charged ``current / n`` instead of ``current``, so
+    the group subtracts the position once between them. Splitting it evenly
+    keeps every contribution meaningful for the confidence weighting below,
+    which folding the whole correction into one intent would not.
+    """
+    absolute = [
+        i for i, intent in enumerate(group) if intent.target_type is TargetType.TARGET_WEIGHT
+    ]
+    if len(absolute) < 2 or position is None or position.quantity == ZERO:
+        return deltas
+    over_charged = position.quantity * (Decimal(1) - Decimal(1) / Decimal(len(absolute)))
+    adjusted = list(deltas)
+    for index in absolute:
+        adjusted[index] += over_charged
+    return adjusted
 
 
 def _to_share_delta(

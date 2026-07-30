@@ -8,7 +8,7 @@ from uuid import uuid4
 from atrader.config.schema import InstrumentSpec
 from atrader.core.models import Fill, Position
 from atrader.core.types import Side
-from atrader.portfolio.pnl import BorrowCostModel, mark_to_market, net_pnl_report
+from atrader.portfolio.pnl import BorrowCostModel, PnLReport, mark_to_market, net_pnl_report
 from atrader.storage.memory import InMemoryPositionStore
 
 BASE_NS = 1_700_000_000_000_000_000
@@ -176,3 +176,48 @@ class TestNetPnLReport:
         )
         assert report.realized_pnl == Decimal("100")
         assert report.fx_adjustment == Decimal("0")
+
+
+class TestFxIsDisclosedNotAddedTwice:
+    """``realized_pnl``/``unrealized_pnl`` are already converted at the FX
+    rate, so ``gross_trading_pnl`` contains the currency component.
+    ``fx_adjustment`` reports how much of it came from the currency rather
+    than the trade — adding it to ``net_pnl`` counted that component twice.
+    """
+
+    def test_net_pnl_matches_what_the_account_actually_received(self) -> None:
+        report = PnLReport(
+            as_of_ns=0,
+            realized_pnl=Decimal("108"),  # 100 EUR at 1.08
+            unrealized_pnl=Decimal("0"),
+            commission=Decimal("0"),
+            tax=Decimal("0"),
+            borrow_cost=Decimal("0"),
+            fx_adjustment=Decimal("8"),
+        )
+        assert report.gross_trading_pnl == Decimal("108")
+        assert report.net_pnl == Decimal("108")
+
+    def test_costs_still_come_off(self) -> None:
+        report = PnLReport(
+            as_of_ns=0,
+            realized_pnl=Decimal("108"),
+            unrealized_pnl=Decimal("0"),
+            commission=Decimal("3"),
+            tax=Decimal("2"),
+            borrow_cost=Decimal("1"),
+            fx_adjustment=Decimal("8"),
+        )
+        assert report.net_pnl == Decimal("102")
+
+    def test_a_base_currency_position_is_unaffected(self) -> None:
+        report = PnLReport(
+            as_of_ns=0,
+            realized_pnl=Decimal("100"),
+            unrealized_pnl=Decimal("50"),
+            commission=Decimal("0"),
+            tax=Decimal("0"),
+            borrow_cost=Decimal("0"),
+            fx_adjustment=Decimal("0"),
+        )
+        assert report.net_pnl == Decimal("150")

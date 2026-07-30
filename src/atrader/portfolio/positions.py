@@ -84,15 +84,27 @@ class PositionBook:
         else:
             opened_at_ns = position.opened_at_ns
 
-        updated = position.model_copy(
-            update={
-                "quantity": signed_qty,
-                "avg_price": avg_price,
-                "realized_pnl": position.realized_pnl + realized,
-                "opened_at_ns": opened_at_ns,
-                "updated_at_ns": now,
-            }
-        )
+        update: dict[str, object] = {
+            "quantity": signed_qty,
+            "avg_price": avg_price,
+            "realized_pnl": position.realized_pnl + realized,
+            "opened_at_ns": opened_at_ns,
+            "updated_at_ns": now,
+        }
+        if now_flat:
+            # A closed position has nothing left to be unrealized about, and
+            # `mark_to_market` skips flat positions, so a stale mark would sit
+            # here forever. Every consumer that reports realized + unrealized
+            # (net_pnl_report, Runtime.pnl_snapshot) would then count the whole
+            # round trip twice: the gain shows up once as realized and again as
+            # an unrealized figure for a position that no longer exists.
+            update["unrealized_pnl"] = ZERO
+        if was_flat and not now_flat:
+            # Opening afresh: any mark left over from the previous cycle in
+            # this symbol belongs to a position that is already settled.
+            update["unrealized_pnl"] = ZERO
+
+        updated = position.model_copy(update=update)
         self.store.upsert(updated)
         return FillApplication(
             position=updated, realized_pnl_delta=realized, closed_quantity=closed
@@ -104,9 +116,20 @@ class PositionBook:
         Fills must be passed in execution order: cost basis is path-dependent,
         so applying them out of order produces a different (wrong) lot
         structure even though the final signed quantity would come out the same.
+
+        Every symbol in the store is reset first, not just the in-memory lots.
+        Clearing only the lots left the *stored* position untouched, so a
+        replay against a persistent store applied each fill on top of state
+        that already contained it — under AVERAGE the recovered quantity came
+        out doubled, violating the quantity-equals-signed-sum-of-fills
+        invariant the property tests pin, and under FIFO the quantity was right
+        while realized P&L was doubled. That is silent corruption of exactly
+        the state this method exists to restore.
         """
         self._lots.clear()
         self._lot_side.clear()
+        for existing in self.store.all_positions():
+            self.store.upsert(Position(symbol=existing.symbol))
         for fill in fills:
             self.apply_fill(fill)
 
