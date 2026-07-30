@@ -863,3 +863,90 @@ class TestApprovalGateTimeout:
 
         assert settled.status.value == "timed_out"
         assert not gate.is_granted(request.request_id)
+
+
+class TestAWeightTargetMustAgreeWithItsSide:
+    """``TARGET_WEIGHT`` names an absolute target, so the direction needed to
+    reach it is recomputed against the *evaluation-time* position — while
+    ``side`` was fixed when the intent was authored. They can legitimately
+    diverge: the approval path re-evaluates an intent minutes later, and the
+    position may have crossed the target in between.
+
+    Sizing took ``abs(delta)`` while the order took ``intent.side``, so a
+    disagreement produced an order pointing away from the target: an intent
+    asking to shrink a position became one that grew it. Under the default
+    config the concentration cap happened to catch it, which is why it
+    survived — loosened here so the direction is what is actually under test.
+    """
+
+    def _engine(self, clock: SimulatedClock) -> RiskEngine:
+        return RiskEngine(
+            config=make_config(
+                position=PositionLimits(max_position_pct=Decimal(50), max_sector_pct=Decimal(90)),
+                order=OrderLimits(
+                    max_order_notional_pct=Decimal(50),
+                    human_approval_threshold_pct=Decimal(99),
+                ),
+            ),
+            clock=clock,
+            ids=DeterministicIdGenerator(clock, seed=1),
+            kill_switch=KillSwitch(clock=clock),
+        )
+
+    def _held(self, shares: str) -> dict[str, Position]:
+        return {
+            "AAPL": Position(
+                symbol="AAPL", quantity=Decimal(shares), avg_price=PRICE, last_price=PRICE
+            )
+        }
+
+    def _weight(self, side: Side, weight: str) -> TradingIntent:
+        return make_intent(
+            side=side, target_type=TargetType.TARGET_WEIGHT, target_value=Decimal(weight)
+        )
+
+    def test_a_buy_that_would_have_to_sell_is_refused(self, clock: SimulatedClock) -> None:
+        """150 shares at 187.50 is 28% of equity; targeting 5% requires
+        selling. A BUY here is a contradiction, and the order it used to
+        produce moved further from the target rather than toward it."""
+        decision = self._engine(clock).evaluate(
+            self._weight(Side.BUY, "0.05"), make_snapshot(positions=self._held("150"))
+        )
+
+        assert decision.action is RiskAction.REJECT
+        assert "disagree" in decision.reason
+        assert decision.order is None
+
+    def test_a_sell_that_would_have_to_buy_is_refused(self, clock: SimulatedClock) -> None:
+        decision = self._engine(clock).evaluate(
+            self._weight(Side.SELL, "0.40"), make_snapshot(positions=self._held("150"))
+        )
+
+        assert decision.action is RiskAction.REJECT
+        assert "disagree" in decision.reason
+
+    def test_the_coherent_direction_moves_toward_the_target(self, clock: SimulatedClock) -> None:
+        decision = self._engine(clock).evaluate(
+            self._weight(Side.SELL, "0.05"), make_snapshot(positions=self._held("150"))
+        )
+
+        assert decision.approved
+        assert decision.order is not None
+        assert decision.order.side is Side.SELL
+        resulting = Decimal("150") + decision.order.quantity * decision.order.side.sign
+        assert resulting < Decimal("150")
+
+    def test_opening_from_flat_is_unaffected(self, clock: SimulatedClock) -> None:
+        """With nothing held there is no prior position to disagree with."""
+        assert (
+            self._engine(clock).evaluate(self._weight(Side.BUY, "0.05"), make_snapshot()).approved
+        )
+
+    def test_share_targets_are_not_second_guessed(self, clock: SimulatedClock) -> None:
+        """SHARES states a delta, not a target — its side is the only
+        direction there is, and nothing recomputes it."""
+        decision = self._engine(clock).evaluate(
+            make_intent(side=Side.BUY, target_value=Decimal("10")),
+            make_snapshot(positions=self._held("150")),
+        )
+        assert decision.approved

@@ -235,6 +235,17 @@ class RiskEngine:
                 alert_level=AlertLevel.WARN,
             )
 
+        conflict = self._weight_direction_conflict(intent, snapshot, price)
+        if conflict is not None:
+            return RiskDecision(
+                risk_check_id=risk_check_id,
+                intent_id=intent.intent_id,
+                action=RiskAction.REJECT,
+                results=tuple(categorical_results),
+                reason=conflict,
+                alert_level=AlertLevel.CRITICAL,
+            )
+
         quantity = self._resolve_quantity(intent, snapshot, price, instrument)
         if quantity <= ZERO:
             return RiskDecision(
@@ -393,6 +404,41 @@ class RiskEngine:
         if market is not None and market > ZERO:
             return market
         return intent.limit_price
+
+    def _weight_direction_conflict(
+        self, intent: TradingIntent, snapshot: RiskSnapshot, price: Decimal
+    ) -> str | None:
+        """Reject a weight target whose arithmetic disagrees with its ``side``.
+
+        ``TARGET_WEIGHT`` names an absolute target, so the direction that
+        reaches it is recomputed here against the *evaluation-time* position —
+        while ``side`` was decided when the intent was authored. Those can
+        legitimately diverge: the approval path re-evaluates an intent minutes
+        later, and the position may have crossed the target in between.
+
+        ``_resolve_quantity`` takes ``abs(delta)`` and ``_build_order`` uses
+        ``intent.side``, so a disagreement produced an order pointing away from
+        the target — an intent asking to shrink a position became one that grew
+        it. Sizing off the recomputed sign instead would be the other way to
+        resolve it, and is worse: it silently overrides what the strategy
+        actually asked for. A gate that cannot tell which of two contradictory
+        instructions is correct must not pick one.
+        """
+        if intent.target_type is not TargetType.TARGET_WEIGHT:
+            return None
+        delta = (
+            snapshot.account.equity * intent.target_value
+            - snapshot.position_of(intent.symbol).market_value
+        )
+        if delta == ZERO or (delta > ZERO) == (intent.side is Side.BUY):
+            return None
+        implied = "BUY" if delta > ZERO else "SELL"
+        return (
+            f"intent says {intent.side.value} but reaching a "
+            f"{intent.target_value} weight from the current position requires {implied}. "
+            "The strategy's stated direction and the target disagree; refusing rather "
+            "than guessing which one it meant."
+        )
 
     def _resolve_quantity(
         self,
