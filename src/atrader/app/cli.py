@@ -240,7 +240,10 @@ async def _serve(
         typer.echo("no enabled strategies configured; refusing to run with an idle book", err=True)
         raise typer.Exit(code=1)
 
-    runtime = Runtime(config, strategies, feature_engine, clock=clock, storage=storage)
+    # Share the AuditLogger the strategies were given: two loggers over
+    # one sink each cache their own seq/prev_hash and produce a chain
+    # that fails verification (acceptance criterion #9).
+    runtime = Runtime(config, strategies, feature_engine, clock=clock, storage=storage, audit=audit)
     api_app = create_app(runtime)
     server = uvicorn.Server(uvicorn.Config(api_app, host=host, port=port, log_level="warning"))
 

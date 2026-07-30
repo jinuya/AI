@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, time
 from decimal import Decimal
 from typing import cast
@@ -142,6 +142,7 @@ class Runtime:
         rng: Rng | None = None,
         feed: MarketDataFeed | None = None,
         storage: InMemoryStorage | None = None,
+        audit: AuditLogger | None = None,
         alerts: AlertRouter | None = None,
         metrics: Metrics | None = None,
     ) -> None:
@@ -150,7 +151,13 @@ class Runtime:
         self.ids = ids or SystemIdGenerator(self.clock)
         self.rng = rng or SeededRng(seed=0)
         self.storage = storage or InMemoryStorage()
-        self.audit = AuditLogger(self.storage.audit, self.clock)
+        # Injectable: an AuditLogger caches the next seq and the previous
+        # hash locally, so two of them over one sink both start from seq 1
+        # and the chain fails verification. The CLI builds one for the
+        # strategies before constructing the Runtime — without this
+        # parameter there was no way to share it, and enabling the LLM
+        # strategy silently broke acceptance criterion #9.
+        self.audit = audit or AuditLogger(self.storage.audit, self.clock)
         self.metrics = metrics or Metrics()
         self.alerts = alerts or AlertRouter(self.clock)
 
@@ -564,9 +571,24 @@ class Runtime:
         approval_request_id: UUID | None = None,
     ) -> RiskDecision:
         snapshot = self._snapshot(at_ns, account, positions)
-        effective_reduce_only = (
-            self.margin_monitor.reduce_only if reduce_only is None else reduce_only
-        )
+        # `reduce_only` here is an *assertion by the caller* that this
+        # particular order shrinks exposure, and the risk engine treats it as
+        # licence to skip the kill switch, the margin block and the eight
+        # growth checks. Only a caller that built a shrinking order may set it
+        # — `_liquidate_all` does; a strategy intent never can.
+        #
+        # It used to default to `margin_monitor.reduce_only`, which means the
+        # opposite: "the account is under a margin call, so only shrinking
+        # orders are allowed" — a restriction. Conflating the two inverted it:
+        # a margin call relabelled every strategy intent as reduce-only and so
+        # bypassed the very block it was supposed to impose, and the kill
+        # switch with it (verified: with the switch engaged, margin OK
+        # rejected while margin REDUCE_ONLY submitted a 500-share buy).
+        #
+        # The restriction reaches the engine the way `MarginMonitor` documents
+        # — as `RiskSnapshot.margin_reduce_only`, built in `_snapshot` — where
+        # `check_system_state` enforces it.
+        effective_reduce_only = bool(reduce_only)
         decision = self.risk_engine.evaluate(
             intent,
             snapshot,
@@ -593,6 +615,21 @@ class Runtime:
         # is not: it is a *new* order that happens to shrink exposure.
         priority = Priority.REDUCING if effective_reduce_only else Priority.NORMAL
         await self.rate_limiter.acquire(priority)
+        # Re-check after the wait. `acquire` can suspend for seconds at NORMAL
+        # priority — the runaway-strategy case the limiter exists for — and the
+        # kill switch can be engaged, complete its cancel sweep, and return
+        # while this order sits in the queue. Submitting it afterwards puts a
+        # working order at the venue that nothing will cancel, since the sweep
+        # has already run. A reduce-only order is exempt for the usual reason:
+        # the switch must never block the thing that closes a position.
+        if self.kill_switch.is_engaged and not effective_reduce_only:
+            return replace(
+                decision,
+                action=RiskAction.REJECT,
+                order=None,
+                reason="kill switch engaged while this order waited on the rate limiter",
+                alert_level=AlertLevel.CRITICAL,
+            )
         report = await self.oms.submit(decision.order)
         self._orders_submitted += 1
         self.metrics.orders_total.labels(status=report.order.status.value).inc()

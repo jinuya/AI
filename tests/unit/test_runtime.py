@@ -16,13 +16,16 @@ from atrader.config.schema import (
 )
 from atrader.core.clock import NS_PER_SECOND, SimulatedClock
 from atrader.core.ids import DeterministicIdGenerator
-from atrader.core.models import TradingIntent
-from atrader.core.types import Side, TargetType
+from atrader.core.models import AccountState, TradingIntent
+from atrader.core.money import ZERO
+from atrader.core.types import RiskAction, Side, TargetType
+from atrader.execution.ratelimit import Priority
 from atrader.features.engine import FeatureEngine
 from atrader.features.registry import FeatureRegistry
 from atrader.features.store import FeatureStore
 from atrader.marketdata.feeds.replay import ReplayFeed
 from atrader.marketdata.models import Tick
+from atrader.risk.engine import RiskDecision
 from atrader.risk.killswitch import KillSwitchSource
 from atrader.strategy.base import Strategy, StrategyContext
 
@@ -443,3 +446,148 @@ class TestDailyEquityCurve:
 
         report = divergence_report(runtime.daily_equity_curve(), runtime.daily_equity_curve())
         assert report.live.num_periods == len(runtime.daily_equity_curve())
+
+
+class TestAMarginCallDoesNotGrantReduceOnlyLicence:
+    """``MarginMonitor.reduce_only`` and ``RiskEngine.evaluate(reduce_only=)``
+    read alike and mean opposite things.
+
+    The monitor's flag is a *restriction*: the account is under a margin call,
+    so only exposure-shrinking orders may go out. The engine's argument is an
+    *assertion by the caller* that this particular order shrinks exposure, and
+    the engine treats it as licence to skip the kill switch, the margin block
+    and the eight growth checks.
+
+    The runtime defaulted the argument to the monitor's flag, which inverted
+    it: a margin call relabelled every strategy intent as reduce-only, and so
+    bypassed the very block it was meant to impose — taking the kill switch
+    with it. Nothing verified the order actually reduced anything.
+    """
+
+    async def _warm(self) -> Runtime:
+        """A runtime that has actually processed bars.
+
+        Hand-setting ``_system_state`` is not enough: a fresh Runtime also has
+        no market data, so every intent dies at the data-quality check long
+        before reaching the one under test. Feeding it real ticks is both
+        simpler and closer to what happens in production.
+        """
+        runtime = make_runtime([_BuyOnceStrategy("buyer", "AAPL")], buy_signal_ticks())
+        await runtime.run_forever()
+        return runtime
+
+    def _account(self, *, margin_call: bool) -> AccountState:
+        return AccountState(
+            cash=Decimal("100000"),
+            equity=Decimal("100000"),
+            buying_power=Decimal("100000"),
+            maintenance_margin=Decimal("95238") if margin_call else ZERO,
+        )
+
+    async def _submit_a_buy(self, runtime: Runtime, account: AccountState) -> RiskDecision:
+        runtime.margin_monitor.evaluate(account)
+        intent = TradingIntent(
+            intent_id=runtime.ids.new_id(),
+            strategy_id="buyer",
+            symbol="AAPL",
+            side=Side.BUY,
+            target_type=TargetType.SHARES,
+            target_value=Decimal("10"),
+            created_at_ns=BASE_NS,
+        )
+        return await runtime._evaluate_and_submit(intent, BASE_NS, account, {})
+
+    async def test_the_kill_switch_still_blocks_under_a_margin_call(self) -> None:
+        runtime = await self._warm()
+        runtime.kill_switch.engage(reason="test", source=KillSwitchSource.CLI)
+
+        before = len(runtime.storage.orders.all_orders())
+
+        decision = await self._submit_a_buy(runtime, self._account(margin_call=True))
+
+        assert runtime.margin_monitor.reduce_only is True
+        assert decision.action is RiskAction.REJECT
+        assert "kill switch" in decision.reason
+        assert len(runtime.storage.orders.all_orders()) == before
+
+    async def test_the_margin_block_itself_applies(self) -> None:
+        """The restriction it was supposed to impose — previously bypassed by
+        the same inversion, so a margin call permitted new exposure."""
+        runtime = await self._warm()
+
+        decision = await self._submit_a_buy(runtime, self._account(margin_call=True))
+
+        assert decision.action is RiskAction.REJECT
+        assert "margin call" in decision.reason
+
+    async def test_an_ordinary_buy_is_unaffected_when_margin_is_healthy(self) -> None:
+        runtime = await self._warm()
+
+        decision = await self._submit_a_buy(runtime, self._account(margin_call=False))
+
+        assert decision.approved
+
+    async def test_liquidation_still_gets_its_exemption(self) -> None:
+        """The one caller that legitimately asserts reduce-only builds an
+        order that closes a position, and must keep working with the kill
+        switch engaged — that is what the switch engages *to do*."""
+        runtime = await self._warm()
+        runtime.kill_switch.engage(reason="test", source=KillSwitchSource.CLI)
+        account = self._account(margin_call=False)
+        intent = TradingIntent(
+            intent_id=runtime.ids.new_id(),
+            strategy_id="killswitch.liquidate",
+            symbol="AAPL",
+            side=Side.SELL,
+            target_type=TargetType.SHARES,
+            target_value=Decimal("10"),
+            created_at_ns=BASE_NS,
+        )
+
+        decision = await runtime._evaluate_and_submit(
+            intent, BASE_NS, account, {}, reduce_only=True
+        )
+
+        assert decision.approved
+
+
+class TestAnOrderThrottledPastAKillIsNotSubmitted:
+    """``rate_limiter.acquire`` can suspend for seconds at NORMAL priority —
+    the runaway-strategy case it exists for. The kill switch can engage,
+    finish its cancel sweep and return while an already-approved order waits
+    in that queue; submitting it afterwards leaves a working order at the
+    venue that nothing will cancel, because the sweep has already run.
+    """
+
+    async def test_the_switch_is_rechecked_after_the_wait(self) -> None:
+        runtime = make_runtime([_BuyOnceStrategy("buyer", "AAPL")], buy_signal_ticks())
+        await runtime.run_forever()
+        account = AccountState(
+            cash=Decimal("100000"), equity=Decimal("100000"), buying_power=Decimal("100000")
+        )
+        intent = TradingIntent(
+            intent_id=runtime.ids.new_id(),
+            strategy_id="buyer",
+            symbol="AAPL",
+            side=Side.BUY,
+            target_type=TargetType.SHARES,
+            target_value=Decimal("10"),
+            created_at_ns=BASE_NS,
+        )
+
+        original_acquire = runtime.rate_limiter.acquire
+
+        async def engage_while_waiting(priority: Priority) -> None:
+            # Stand in for a slow queue: the switch flips during the wait.
+            runtime.kill_switch.engage(reason="mid-wait", source=KillSwitchSource.HTTP)
+            await original_acquire(priority)
+
+        runtime.rate_limiter.acquire = engage_while_waiting  # type: ignore[method-assign]
+
+        before = len(runtime.storage.orders.all_orders())
+
+        decision = await runtime._evaluate_and_submit(intent, BASE_NS, account, {})
+
+        assert decision.action is RiskAction.REJECT
+        assert "rate limiter" in decision.reason
+        assert len(runtime.storage.orders.all_orders()) == before
