@@ -141,7 +141,7 @@ class BarBuilder:
 class BarAggregator:
     """Builds bars for many symbols across several intervals at once."""
 
-    __slots__ = ("_builders", "_intervals")
+    __slots__ = ("_builders", "_intervals", "_last_closed")
 
     def __init__(self, intervals: tuple[str, ...] = ("1m",)) -> None:
         if not intervals:
@@ -150,6 +150,12 @@ class BarAggregator:
             interval_to_ns(interval)
         self._intervals = intervals
         self._builders: dict[tuple[str, str], BarBuilder] = {}
+        #: Highest bucket already published as final, per (symbol, interval).
+        #: The late-tick guard in `add` can only see a builder that is still
+        #: open, so once a timer closed and removed one, a tick belonging to
+        #: that bucket re-opened it and the same bar went out a second time
+        #: with rewritten OHLCV. Nothing downstream de-duplicates bars.
+        self._last_closed: dict[tuple[str, str], int] = {}
 
     @property
     def intervals(self) -> tuple[str, ...]:
@@ -174,15 +180,21 @@ class BarAggregator:
             key = (tick.symbol, interval)
             builder = self._builders.get(key)
 
+            if bucket <= self._last_closed.get(key, -1):
+                # Late tick for a bar already published as final. Dropping it
+                # is the honest choice: re-opening a published bar would
+                # rewrite history a strategy has already acted on. This holds
+                # whether the bar was closed by a later tick or by the timer,
+                # which is the case the builder check below cannot see.
+                continue
+
             if builder is not None and builder.open_ts != bucket:
                 if builder.open_ts > bucket:
-                    # Late tick for an already-closed bar. Dropping it is the
-                    # honest choice: re-opening a published bar would rewrite
-                    # history a strategy has already acted on.
                     continue
                 finished = builder.build(is_final=True)
                 if finished is not None:
                     completed.append(finished)
+                self._last_closed[key] = builder.open_ts
                 builder = None
 
             if builder is None:
@@ -210,6 +222,7 @@ class BarAggregator:
                 finished = builder.build(is_final=True)
                 if finished is not None:
                     completed.append(finished)
+                self._last_closed[key] = builder.open_ts
                 del self._builders[key]
         return completed
 
@@ -220,5 +233,7 @@ class BarAggregator:
             for builder in self._builders.values()
             if (bar := builder.build(is_final=True)) is not None
         ]
+        for key, builder in self._builders.items():
+            self._last_closed[key] = builder.open_ts
         self._builders.clear()
         return completed

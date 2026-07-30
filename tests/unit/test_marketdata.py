@@ -642,3 +642,69 @@ class TestSimulatedFeedCadence:
         # emitted - 1, not emitted: the generator is suspended at the yield of
         # the last tick, so that round's clock advance has not run yet.
         assert clock.now_ns() == BASE_NS + (emitted - 1) * NS_PER_SECOND
+
+
+class TestABarIsPublishedFinalExactlyOnce:
+    """The late-tick guard only ever saw an *open* builder. Once the timer
+    closed and removed one, a tick belonging to that bucket opened a fresh
+    builder at the same ``open_ts`` and the identical bar went out a second
+    time as ``is_final=True``, with rewritten OHLCV. Nothing downstream
+    de-duplicates bars, so both reached the strategies — breaking the
+    exactly-one-final-bar contract and deterministic replay alike.
+
+    The race is routine, not exotic: ``close_expired`` compares wall-clock
+    ``now_ns`` against an ``open_ts`` derived from ``exchange_ts``, so any feed
+    lag at a bucket boundary delivers in-bucket ticks after the timer fired.
+    """
+
+    def _tick(self, second: int, price: str, seq: int) -> Tick:
+        ts = second * NS_PER_SECOND
+        return Tick(
+            symbol="AAPL",
+            exchange_ts=ts,
+            ingest_ts=ts + 1,
+            last=Decimal(price),
+            last_size=Decimal("1"),
+            seq=seq,
+        )
+
+    def test_a_tick_arriving_after_the_timer_closed_its_bar_is_dropped(self) -> None:
+        aggregator = BarAggregator(intervals=("1m",))
+        aggregator.add(self._tick(10, "100", 1))
+        aggregator.add(self._tick(20, "101", 2))
+
+        first = aggregator.close_expired(now_ns=61 * NS_PER_SECOND)
+        assert [b.open_ts for b in first] == [0]
+
+        aggregator.add(self._tick(59, "250", 3))
+        assert aggregator.close_expired(now_ns=122 * NS_PER_SECOND) == []
+
+    def test_the_published_bar_is_not_rewritten(self) -> None:
+        aggregator = BarAggregator(intervals=("1m",))
+        aggregator.add(self._tick(10, "100", 1))
+        (published,) = aggregator.close_expired(now_ns=61 * NS_PER_SECOND)
+
+        aggregator.add(self._tick(59, "250", 2))
+
+        assert published.close == Decimal("100")
+        assert aggregator.forming("AAPL", "1m") is None
+
+    def test_flush_also_closes_the_bucket_to_later_ticks(self) -> None:
+        aggregator = BarAggregator(intervals=("1m",))
+        aggregator.add(self._tick(10, "100", 1))
+        assert len(aggregator.flush()) == 1
+
+        aggregator.add(self._tick(30, "250", 2))
+        assert aggregator.flush() == []
+
+    def test_a_tick_for_the_next_bucket_still_opens_a_bar(self) -> None:
+        """The watermark must block only what was already published."""
+        aggregator = BarAggregator(intervals=("1m",))
+        aggregator.add(self._tick(10, "100", 1))
+        aggregator.close_expired(now_ns=61 * NS_PER_SECOND)
+
+        aggregator.add(self._tick(70, "105", 2))
+
+        forming = aggregator.forming("AAPL", "1m")
+        assert forming is not None
+        assert forming.open_ts == 60 * NS_PER_SECOND

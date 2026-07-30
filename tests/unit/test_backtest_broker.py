@@ -308,3 +308,51 @@ class TestAccountAndPositions:
         await broker.submit_order(make_request())
         await broker.close()
         assert broker.pending_events() == []
+
+
+class TestOpenPositionsAreMarkedToMarket:
+    """``last_price`` was written only at fill time, so ``get_account()`` —
+    and with it the equity curve, the daily-loss input and the drawdown input
+    — stayed frozen at the last traded price. A position could halve while
+    reported equity did not move, which is precisely the scenario the loss
+    limit and the drawdown breaker exist to catch: neither could ever fire on
+    an open position, and every performance metric was computed from a curve
+    blind to unrealized P&L.
+    """
+
+    async def _long_ten(self) -> BacktestBroker:
+        broker = BacktestBroker(clock=SimulatedClock(start_ns=BASE_NS))
+        await broker.submit_order(make_request())
+        broker.advance_bar(make_bar(open_="100", high="100", low="100", close="100"))
+        return broker
+
+    async def test_equity_follows_the_bar_close(self) -> None:
+        broker = await self._long_ten()
+        opening = (await broker.get_account()).equity
+
+        broker.advance_bar(make_bar(open_="200", high="200", low="200", close="200"))
+
+        assert (await broker.get_account()).equity > opening
+
+    async def test_a_falling_price_reduces_equity(self) -> None:
+        broker = await self._long_ten()
+        opening = (await broker.get_account()).equity
+
+        broker.advance_bar(make_bar(open_="50", high="50", low="50", close="50"))
+
+        assert (await broker.get_account()).equity < opening
+
+    async def test_the_position_carries_the_latest_mark(self) -> None:
+        broker = await self._long_ten()
+        broker.advance_bar(make_bar(open_="175", high="175", low="175", close="175"))
+
+        (position,) = await broker.get_positions()
+        assert position.last_price == Decimal("175")
+
+    async def test_a_flat_book_is_unaffected(self) -> None:
+        broker = BacktestBroker(clock=SimulatedClock(start_ns=BASE_NS))
+        before = (await broker.get_account()).equity
+
+        broker.advance_bar(make_bar(open_="500", high="500", low="500", close="500"))
+
+        assert (await broker.get_account()).equity == before

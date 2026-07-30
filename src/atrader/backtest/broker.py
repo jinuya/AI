@@ -255,6 +255,8 @@ class BacktestBroker:
         strategy has reacted to it — never before, or a fill could happen at
         a price the order was priced against in the first place.
         """
+        self._mark_to_market(bar)
+
         events: list[BrokerEvent] = []
         for resting in list(self._orders.values()):
             if resting.request.symbol != bar.symbol or not resting.status.is_open:
@@ -356,6 +358,24 @@ class BacktestBroker:
             last_price=price,
             opened_at_ns=current.opened_at_ns or self.clock.now_ns(),
             updated_at_ns=self.clock.now_ns(),
+        )
+
+    def _mark_to_market(self, bar: Bar) -> None:
+        """Re-mark this symbol's open position against the bar's close.
+
+        ``last_price`` was only ever written at fill time, so ``get_account()``
+        — and therefore the equity curve, the daily-loss input and the drawdown
+        input — was frozen at the last traded price. A position could halve
+        while the reported equity did not move, which is exactly the scenario
+        the loss limit and the drawdown breaker exist to catch: neither could
+        ever fire on an open position, and every performance metric was
+        computed from a curve blind to unrealized P&L.
+        """
+        position = self._positions.get(bar.symbol)
+        if position is None or position.is_flat or position.last_price == bar.close:
+            return
+        self._positions[bar.symbol] = position.model_copy(
+            update={"last_price": bar.close, "updated_at_ns": self.clock.now_ns()}
         )
 
     def _next_order_id(self) -> str:
